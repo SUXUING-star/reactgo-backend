@@ -290,9 +290,9 @@ func main() {
 		// 或者 log.Fatal(err)，取决于是否要终止程序
 	}
 
-	// 将 CORS 配置修改为：
+	// 将现有的 CORS 配置替换为：
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"http://localhost:5173"}, // Vite 默认开发服务器地址
+		AllowOrigins:     []string{"https://my-login-app-one.vercel.app"}, // 替换为你的 Vercel 域名
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Length", "Content-Type", "Authorization"},
 		ExposeHeaders:    []string{"Content-Length"},
