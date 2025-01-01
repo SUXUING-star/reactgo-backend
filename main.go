@@ -596,7 +596,7 @@ func sendVerificationEmail(to, token string) error {
 	m.SetHeader("Subject", "验证您的邮箱")
 
 	//verifyLink := fmt.Sprintf("http://localhost:5173/verify-email?token=%s", token)
-	verifyLink := fmt.Sprintf("https://my-login-app-one.vercel.app/verify-email?token=%s", token)
+	verifyLink := fmt.Sprintf("https://www.suxingchahui.space/verify-email?token=%s", token)
 	htmlBody := fmt.Sprintf(`
         <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
             <h2 style="color: #333;">欢迎注册茶会!</h2>
