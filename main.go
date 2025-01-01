@@ -1,10 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/tls"
+	"encoding/hex"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -16,16 +23,21 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"golang.org/x/crypto/bcrypt"
+	"gopkg.in/gomail.v2"
 )
 
 var client *mongo.Client
 var jwtSecret = []byte(os.Getenv("JWT_SECRET")) // 使用全局变量，并初始化
 
 type User struct {
-	ID        primitive.ObjectID `bson:"_id,omitempty"`
-	Username  string             `bson:"username"`
-	Password  string             `bson:"password"`
-	CreatedAt time.Time          `bson:"created_at"`
+	ID             primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	Username       string             `bson:"username" json:"username"`
+	Password       string             `bson:"password" json:"password"`
+	Email          string             `bson:"email" json:"email"`
+	IsVerified     bool               `bson:"is_verified" json:"is_verified"`
+	VerifyToken    string             `bson:"verify_token" json:"verify_token"` // Make sure this field exists
+	TokenExpiredAt time.Time          `bson:"token_expired_at" json:"token_expired_at"`
+	CreatedAt      time.Time          `bson:"created_at" json:"created_at"`
 }
 
 type Claims struct {
@@ -33,6 +45,14 @@ type Claims struct {
 	Username string `json:"username"`
 	jwt.RegisteredClaims
 }
+type EmailConfig struct {
+	From     string
+	AuthCode string
+	SmtpHost string
+	SmtpPort string
+}
+
+var emailConfig EmailConfig
 
 // Post 结构体添加 CommentsCount 字段
 type Post struct {
@@ -69,6 +89,12 @@ func init() {
 		secret = "defaultsecret"
 	}
 	jwtSecret = []byte(secret)
+	emailConfig = EmailConfig{
+		From:     os.Getenv("EMAIL_FROM"),
+		AuthCode: os.Getenv("EMAIL_AUTH_CODE"),
+		SmtpHost: os.Getenv("EMAIL_SMTP_HOST"),
+		SmtpPort: os.Getenv("EMAIL_SMTP_PORT"),
+	}
 }
 
 // 文件上传处理
@@ -95,13 +121,22 @@ func HandleFileUpload(c *gin.Context) {
 func getUserPosts(c *gin.Context) {
 	userID, err := primitive.ObjectIDFromHex(c.Param("id"))
 	if err != nil {
+		log.Printf("Invalid user ID: %v", err)
 		c.JSON(400, gin.H{"error": "Invalid user ID"})
 		return
 	}
 
+	log.Printf("Fetching posts for user ID: %v", userID)
+
 	collection := client.Database("forum").Collection("posts")
-	cursor, err := collection.Find(context.TODO(), bson.M{"author_id": userID})
+
+	// 添加调试日志：打印查询条件
+	log.Printf("Searching posts with query: %+v", bson.M{"author": userID})
+
+	// 使用author字段而不是author_id
+	cursor, err := collection.Find(context.TODO(), bson.M{"author": userID})
 	if err != nil {
+		log.Printf("Error fetching posts: %v", err)
 		c.JSON(500, gin.H{"error": "Failed to fetch posts"})
 		return
 	}
@@ -109,24 +144,38 @@ func getUserPosts(c *gin.Context) {
 
 	var posts []Post
 	if err = cursor.All(context.TODO(), &posts); err != nil {
+		log.Printf("Error decoding posts: %v", err)
 		c.JSON(500, gin.H{"error": "Failed to decode posts"})
 		return
+	}
+
+	// 打印找到的帖子信息
+	for _, post := range posts {
+		log.Printf("Found post: ID=%v, Title=%v, Author=%v", post.ID, post.Title, post.Author)
+	}
+
+	if posts == nil {
+		posts = []Post{}
 	}
 
 	c.JSON(200, posts)
 }
 
-// 获取用户评论
 func getUserComments(c *gin.Context) {
 	userID, err := primitive.ObjectIDFromHex(c.Param("id"))
 	if err != nil {
+		log.Printf("Invalid user ID: %v", err)
 		c.JSON(400, gin.H{"error": "Invalid user ID"})
 		return
 	}
 
+	log.Printf("Fetching comments for user ID: %v", userID)
+
 	collection := client.Database("forum").Collection("comments")
-	cursor, err := collection.Find(context.TODO(), bson.M{"author_id": userID})
+	// 使用author字段而不是author_id
+	cursor, err := collection.Find(context.TODO(), bson.M{"author": userID})
 	if err != nil {
+		log.Printf("Error fetching comments: %v", err)
 		c.JSON(500, gin.H{"error": "Failed to fetch comments"})
 		return
 	}
@@ -134,8 +183,13 @@ func getUserComments(c *gin.Context) {
 
 	var comments []Comment
 	if err = cursor.All(context.TODO(), &comments); err != nil {
+		log.Printf("Error decoding comments: %v", err)
 		c.JSON(500, gin.H{"error": "Failed to decode comments"})
 		return
+	}
+
+	if comments == nil {
+		comments = []Comment{}
 	}
 
 	c.JSON(200, comments)
@@ -434,10 +488,11 @@ func main() {
 
 	// 将现有的 CORS 配置替换为：
 	r.Use(cors.New(cors.Config{
-		//AllowOrigins:   []string{"http://localhost:5173", "http://127.0.0.1:5173"}, // 本地开发环境
-		AllowOrigins:     []string{"https://my-login-app-one.vercel.app"}, // 替换为你的 Vercel 域名
+		//git add . && git commit -m "up" && git push origin master
+		//AllowOrigins: []string{"http://localhost:5173", "http://127.0.0.1:5173"}, // 本地开发环境
+		AllowOrigins:     []string{"https://www.suxingchahui.space/"}, // 替换为你的 Vercel 域名
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Length", "Content-Type", "Authorization"},
+		AllowHeaders:     []string{"Origin", "Content-Length", "Content-Type", "Authorization", "Cache-Control"},
 		ExposeHeaders:    []string{"Content-Length"},
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
@@ -462,6 +517,7 @@ func main() {
 		// 认证相关
 		api.POST("/register", handleRegister)
 		api.POST("/login", handleLogin)
+		api.GET("/verify-email", handleVerifyEmail) // 注意这里不需要 authMiddleware
 
 		// 帖子相关
 		api.GET("/posts", getPosts)
@@ -483,42 +539,235 @@ func main() {
 	}
 
 	log.Fatal(r.Run(":" + port))
+	// 每24小时清理一次未验证的账户
+	go func() {
+		for {
+			cleanupUnverifiedAccounts()
+			time.Sleep(24 * time.Hour)
+		}
+	}()
 }
 
+// 删除未验证的过期账户
+func cleanupUnverifiedAccounts() {
+	collection := client.Database("forum").Collection("users")
+
+	// 删除24小时前未验证的账户
+	filter := bson.M{
+		"is_verified": false,
+		"created_at": bson.M{
+			"$lt": time.Now().Add(-24 * time.Hour),
+		},
+	}
+
+	result, err := collection.DeleteMany(context.TODO(), filter)
+	if err != nil {
+		log.Printf("Error cleaning up unverified accounts: %v", err)
+		return
+	}
+
+	log.Printf("Cleaned up %v unverified accounts", result.DeletedCount)
+}
+func sendVerificationEmail(to, token string) error {
+	m := gomail.NewMessage()
+
+	// 修改 From 头部格式，确保符合 RFC 5322 规范
+	m.SetHeader("From", fmt.Sprintf("%s <%s>", "Tea Forum", emailConfig.From))
+	m.SetHeader("To", to)
+	m.SetHeader("Subject", "验证您的邮箱")
+
+	//verifyLink := fmt.Sprintf("http://localhost:5173/verify-email?token=%s", token)
+	verifyLink := fmt.Sprintf("https://my-login-app-one.vercel.app/verify-email?token=%s", token)
+	htmlBody := fmt.Sprintf(`
+        <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+            <h2 style="color: #333;">欢迎注册茶会!</h2>
+            <p style="color: #666;">请点击下面的链接验证你的邮箱:</p>
+            <a href="%s" style="display: inline-block; padding: 10px 20px; background-color: #4F46E5; color: white; text-decoration: none; border-radius: 5px;">验证邮箱</a>
+            <p style="color: #666; margin-top: 20px;">此链接24小时内有效</p>
+        </div>
+    `, verifyLink)
+
+	m.SetBody("text/html", htmlBody)
+
+	// 使用 465 端口并启用 SSL
+	d := gomail.NewDialer(emailConfig.SmtpHost, 465, emailConfig.From, emailConfig.AuthCode)
+	d.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+
+	if err := d.DialAndSend(m); err != nil {
+		log.Printf("Error sending email: %v", err)
+		return fmt.Errorf("failed to send email: %v", err)
+	}
+
+	return nil
+}
+
+func handleVerifyEmail(c *gin.Context) {
+	token := c.Query("token")
+	if token == "" {
+		log.Printf("Missing verification token")
+		c.JSON(400, gin.H{"error": "无效的验证链接"})
+		return
+	}
+
+	log.Printf("Verifying email with token: %s", token)
+
+	collection := client.Database("forum").Collection("users")
+
+	// 首先尝试查找用户
+	var user User
+	err := collection.FindOne(context.TODO(), bson.M{
+		"verify_token": token,
+	}).Decode(&user)
+
+	// 如果找不到用户，再查找已验证的用户
+	if err != nil {
+		var verifiedUser User
+		err = collection.FindOne(context.TODO(), bson.M{
+			"is_verified": true,
+		}).Decode(&verifiedUser)
+		if err == nil {
+			c.JSON(200, gin.H{"message": "邮箱已经验证过了，请直接登录"})
+			return
+		}
+		log.Printf("Error finding user: %v", err)
+		c.JSON(400, gin.H{"error": "无效的验证链接"})
+		return
+	}
+
+	// 检查是否已验证
+	if user.IsVerified {
+		c.JSON(200, gin.H{"message": "邮箱已经验证过了，请直接登录"})
+		return
+	}
+
+	// 更新用户状态
+	result, err := collection.UpdateOne(
+		context.TODO(),
+		bson.M{"_id": user.ID},
+		bson.M{
+			"$set": bson.M{
+				"is_verified":      true,
+				"verify_token":     "",
+				"token_expired_at": time.Time{},
+			},
+		},
+	)
+
+	if err != nil {
+		log.Printf("Error updating user: %v", err)
+		c.JSON(500, gin.H{"error": "验证邮箱失败，请重试"})
+		return
+	}
+
+	log.Printf("Successfully verified user %s. ModifiedCount: %d", user.Username, result.ModifiedCount)
+	c.JSON(200, gin.H{"message": "邮箱验证成功！"})
+}
+
+func isValidEmail(email string) bool {
+	// 基本的邮箱格式验证
+	pattern := `^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`
+	match, err := regexp.MatchString(pattern, email)
+	if err != nil {
+		return false
+	}
+	return match
+}
+func generateRandomToken() string {
+	// 生成32字节的随机数据
+	bytes := make([]byte, 32)
+	if _, err := rand.Read(bytes); err != nil {
+		return ""
+	}
+	// 转换为16进制字符串
+	return hex.EncodeToString(bytes)
+}
+
+// Modify handleRegister function
 func handleRegister(c *gin.Context) {
+	// 打印原始请求体
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		log.Printf("Error reading request body: %v", err)
+		c.JSON(400, gin.H{"error": "无法读取请求数据"})
+		return
+	}
+	// 打印原始请求体
+	log.Printf("Raw request body: %s", string(body))
+	// 重新设置请求体
+	c.Request.Body = io.NopCloser(bytes.NewBuffer(body))
+
 	var user User
 	if err := c.ShouldBindJSON(&user); err != nil {
-		c.JSON(400, gin.H{"error": "Invalid request"})
+		log.Printf("Error binding JSON: %v", err)
+		c.JSON(400, gin.H{"error": "请提供用户名、密码和邮箱"})
 		return
 	}
 
-	// 检查用户名是否已存在
+	// 打印接收到的数据
+	log.Printf("Received registration data - Username: %s, Email: %s, Password length: %d",
+		user.Username, user.Email, len(user.Password))
+
+	// 验证必要字段
+	if user.Username == "" || user.Password == "" || user.Email == "" {
+		log.Printf("Missing required fields - Username: %v, Password: %v, Email: %v",
+			user.Username != "", user.Password != "", user.Email != "")
+		c.JSON(400, gin.H{"error": "用户名、密码和邮箱都不能为空"})
+		return
+	}
+
+	// 验证邮箱格式
+	if !isValidEmail(user.Email) {
+		log.Printf("Invalid email format: %s", user.Email)
+		c.JSON(400, gin.H{"error": "Invalid email format"})
+		return
+	}
+
 	collection := client.Database("forum").Collection("users")
 	var existingUser User
-	err := collection.FindOne(context.TODO(), bson.M{"username": user.Username}).Decode(&existingUser)
+	err = collection.FindOne(context.TODO(), bson.M{
+		"$or": []bson.M{
+			{"username": user.Username},
+			{"email": user.Email},
+		},
+	}).Decode(&existingUser)
 	if err == nil {
-		c.JSON(400, gin.H{"error": "Username already exists"})
+		log.Printf("User already exists - Username: %s, Email: %s", user.Username, user.Email)
+		c.JSON(400, gin.H{"error": "Username or email already exists"})
 		return
 	}
 
-	// 加密密码
+	verifyToken := generateRandomToken()
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(user.Password), bcrypt.DefaultCost)
 	if err != nil {
-		c.JSON(500, gin.H{"error": "Internal server error"})
+		log.Printf("Error hashing password: %v", err)
+		c.JSON(500, gin.H{"error": "Error processing password"})
 		return
 	}
 
-	// 创建新用户
-	user.Password = string(hashedPassword)
-	user.CreatedAt = time.Now()
+	newUser := User{
+		Username:       user.Username,
+		Password:       string(hashedPassword),
+		Email:          user.Email,
+		IsVerified:     false,
+		VerifyToken:    verifyToken,
+		TokenExpiredAt: time.Now().Add(24 * time.Hour),
+		CreatedAt:      time.Now(),
+	}
 
-	result, err := collection.InsertOne(context.TODO(), user)
+	_, err = collection.InsertOne(context.TODO(), newUser)
 	if err != nil {
+		log.Printf("Error creating user: %v", err)
 		c.JSON(500, gin.H{"error": "Failed to create user"})
 		return
 	}
 
-	c.JSON(201, gin.H{"id": result.InsertedID})
+	// 发送验证邮件
+	if err := sendVerificationEmail(user.Email, verifyToken); err != nil {
+		log.Printf("Failed to send verification email: %v", err)
+	}
+
+	log.Printf("Successfully registered user: %s with email: %s", user.Username, user.Email)
+	c.JSON(201, gin.H{"message": "User created successfully"})
 }
 
 func handleLogin(c *gin.Context) {
@@ -527,28 +776,56 @@ func handleLogin(c *gin.Context) {
 		Password string `json:"password"`
 	}
 
+	// 读取请求体
 	if err := c.ShouldBindJSON(&credentials); err != nil {
-		c.JSON(400, gin.H{"error": "Invalid request"})
+		log.Printf("Invalid request: %v", err)
+		c.JSON(400, gin.H{"error": "无效的请求"})
 		return
 	}
 
-	// 查找用户
+	// 确保密码不为空
+	if credentials.Password == "" || credentials.Username == "" {
+		c.JSON(400, gin.H{"error": "用户名和密码不能为空"})
+		return
+	}
+
 	collection := client.Database("forum").Collection("users")
 	var user User
-	err := collection.FindOne(context.TODO(), bson.M{"username": credentials.Username}).Decode(&user)
+
+	// 查找用户
+	err := collection.FindOne(context.TODO(), bson.M{
+		"username": credentials.Username,
+	}).Decode(&user)
+
 	if err != nil {
-		c.JSON(401, gin.H{"error": "Invalid credentials"})
+		log.Printf("User not found: %v", err)
+		c.JSON(401, gin.H{"error": "用户名或密码错误"})
 		return
 	}
 
-	// 验证密码
-	err = bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(credentials.Password))
+	// 检查密码长度和内容
+	log.Printf("Login attempt - Username: %s, Password length: %d",
+		credentials.Username, len(credentials.Password))
+
+	// 验证密码 - 直接使用字节比较
+	err = bcrypt.CompareHashAndPassword(
+		[]byte(user.Password),
+		[]byte(credentials.Password),
+	)
+
 	if err != nil {
-		c.JSON(401, gin.H{"error": "Invalid credentials"})
+		log.Printf("Password verification failed: %v", err)
+		c.JSON(401, gin.H{"error": "用户名或密码错误"})
 		return
 	}
 
-	// 生成JWT
+	// 检查邮箱验证状态
+	if !user.IsVerified {
+		c.JSON(401, gin.H{"error": "请先验证邮箱后再登录"})
+		return
+	}
+
+	// 生成 token
 	claims := &Claims{
 		ID:       user.ID.Hex(),
 		Username: user.Username,
@@ -560,15 +837,19 @@ func handleLogin(c *gin.Context) {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	tokenString, err := token.SignedString(jwtSecret)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not generate token"})
+		log.Printf("Token generation failed: %v", err)
+		c.JSON(500, gin.H{"error": "生成令牌失败"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	c.JSON(200, gin.H{
 		"token": tokenString,
 		"user": gin.H{
-			"id":       user.ID.Hex(),
-			"username": user.Username,
+			"id":          user.ID.Hex(),
+			"username":    user.Username,
+			"email":       user.Email,
+			"is_verified": user.IsVerified,
+			"created_at":  user.CreatedAt,
 		},
 	})
 }
