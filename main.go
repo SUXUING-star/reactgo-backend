@@ -485,14 +485,16 @@ func main() {
 		log.Printf("Failed to set trusted proxies: %v", err)
 		// 或者 log.Fatal(err)，取决于是否要终止程序
 	}
-
+	//git add . && git commit -m "add" && git push origin master
 	// 将现有的 CORS 配置替换为：
 	// 在 main.go 中修改 CORS 配置
+	// main.go 中的 CORS 配置
 	r.Use(cors.New(cors.Config{
 		AllowOrigins: []string{
-			"http://localhost:5173",          // 本地开发环境
-			"http://127.0.0.1:5173",          // 本地开发环境
-			"https://www.suxingchahui.space", // 生产环境域名
+			"http://localhost:5173",               // 本地开发环境
+			"http://127.0.0.1:5173",               // 本地开发环境
+			"https://www.suxingchahui.space",      // 生产环境域名
+			"https://my-login-app-one.vercel.app", // Vercel 部署的前端域名
 		},
 		AllowMethods: []string{
 			"GET",
