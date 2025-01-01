@@ -594,7 +594,7 @@ func sendVerificationEmail(to, token string) error {
 	m.SetHeader("From", fmt.Sprintf("%s <%s>", "Tea Forum", emailConfig.From))
 	m.SetHeader("To", to)
 	m.SetHeader("Subject", "验证您的邮箱")
-
+	//git add . && git commit -m "add" && git push origin master
 	//verifyLink := fmt.Sprintf("http://localhost:5173/verify-email?token=%s", token)
 	verifyLink := fmt.Sprintf("https://www.suxingchahui.space/verify-email?token=%s", token)
 	htmlBody := fmt.Sprintf(`
