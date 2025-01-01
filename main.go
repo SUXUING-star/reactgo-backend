@@ -487,12 +487,29 @@ func main() {
 	}
 
 	// 将现有的 CORS 配置替换为：
+	// 在 main.go 中修改 CORS 配置
 	r.Use(cors.New(cors.Config{
-		//git add . && git commit -m "up" && git push origin master
-		//AllowOrigins: []string{"http://localhost:5173", "http://127.0.0.1:5173"}, // 本地开发环境
-		AllowOrigins:     []string{"https://www.suxingchahui.space/"}, // 替换为你的 Vercel 域名
-		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Length", "Content-Type", "Authorization", "Cache-Control"},
+		AllowOrigins: []string{
+			"http://localhost:5173",          // 本地开发环境
+			"http://127.0.0.1:5173",          // 本地开发环境
+			"https://www.suxingchahui.space", // 生产环境域名
+		},
+		AllowMethods: []string{
+			"GET",
+			"POST",
+			"PUT",
+			"PATCH",
+			"DELETE",
+			"HEAD",
+			"OPTIONS",
+		},
+		AllowHeaders: []string{
+			"Origin",
+			"Content-Length",
+			"Content-Type",
+			"Authorization",
+			"Cache-Control",
+		},
 		ExposeHeaders:    []string{"Content-Length"},
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
@@ -885,6 +902,9 @@ func authMiddleware() gin.HandlerFunc {
 
 		c.Set("user_id", userID)
 		c.Set("username", claims.Username)
+		log.Printf("Incoming request from origin: %s", c.Request.Header.Get("Origin"))
+		log.Printf("Request method: %s", c.Request.Method)
+		log.Printf("Request headers: %+v", c.Request.Header)
 		c.Next()
 	}
 }
