@@ -44,6 +44,7 @@ type Post struct {
 	Author        string             `bson:"author" json:"author"`
 	CreatedAt     time.Time          `bson:"created_at" json:"created_at"`
 	CommentsCount int                `bson:"comments_count" json:"comments_count"`
+	ImageURL      string             `bson:"image_url" json:"imageURL"` // 修改这里
 }
 
 type Comment struct {
@@ -202,36 +203,150 @@ func updatePost(c *gin.Context) {
 	c.JSON(200, gin.H{"message": "Post updated successfully"})
 }
 
-// 删除帖子
 func deletePost(c *gin.Context) {
 	postID, err := primitive.ObjectIDFromHex(c.Param("id"))
 	if err != nil {
+		log.Printf("Invalid post ID: %v", err)
 		c.JSON(400, gin.H{"error": "Invalid post ID"})
 		return
 	}
 
-	userID, _ := c.Get("user_id")
-
-	collection := client.Database("forum").Collection("posts")
-	result, err := collection.DeleteOne(context.TODO(), bson.M{
-		"_id":       postID,
-		"author_id": userID.(primitive.ObjectID),
-	})
-	if err != nil {
-		c.JSON(500, gin.H{"error": "Failed to delete post"})
+	userID, exists := c.Get("user_id")
+	if !exists {
+		log.Printf("User ID not found in context")
+		c.JSON(401, gin.H{"error": "User ID not found"})
 		return
 	}
 
-	if result.DeletedCount == 0 {
+	username, exists := c.Get("username")
+	if !exists {
+		log.Printf("Username not found in context")
+		c.JSON(401, gin.H{"error": "Username not found"})
+		return
+	}
+	collection := client.Database("forum").Collection("posts")
+
+	// 如果是管理员，不需要检查作者，直接删除
+	if username.(string) == "admin" {
+		log.Printf("Admin user detected, proceeding with deletion")
+		_, err := collection.DeleteOne(context.TODO(), bson.M{"_id": postID})
+		if err != nil {
+			log.Printf("Error during admin deletion: %v", err)
+			c.JSON(500, gin.H{"error": "Failed to delete post"})
+			return
+		}
+
+		// 删除相关评论
+		commentsCollection := client.Database("forum").Collection("comments")
+		_, err = commentsCollection.DeleteMany(context.TODO(), bson.M{"post_id": postID})
+		if err != nil {
+			log.Printf("Error deleting comments: %v", err)
+		}
+
+		log.Printf("Post successfully deleted by admin")
+		c.JSON(200, gin.H{"message": "Post deleted successfully by admin"})
+		return
+	}
+
+	// 非管理员，需要验证作者身份
+	var post Post
+	err = collection.FindOne(context.TODO(), bson.M{"_id": postID}).Decode(&post)
+	if err != nil {
+		log.Printf("Error finding post: %v", err)
+		c.JSON(404, gin.H{"error": "Post not found"})
+		return
+	}
+
+	log.Printf("Post author ID: %v, Current user ID: %v", post.AuthorID, userID)
+	if post.AuthorID != userID.(primitive.ObjectID) {
+		log.Printf("User not authorized to delete this post")
 		c.JSON(403, gin.H{"error": "Not authorized to delete this post"})
+		return
+	}
+
+	_, err = collection.DeleteOne(context.TODO(), bson.M{"_id": postID})
+	if err != nil {
+		log.Printf("Error during deletion: %v", err)
+		c.JSON(500, gin.H{"error": "Failed to delete post"})
 		return
 	}
 
 	// 删除相关评论
 	commentsCollection := client.Database("forum").Collection("comments")
-	_, _ = commentsCollection.DeleteMany(context.TODO(), bson.M{"post_id": postID})
+	_, err = commentsCollection.DeleteMany(context.TODO(), bson.M{"post_id": postID})
+	if err != nil {
+		log.Printf("Error deleting comments: %v", err)
+	}
 
+	log.Printf("Post successfully deleted by author")
 	c.JSON(200, gin.H{"message": "Post deleted successfully"})
+}
+func deleteComment(c *gin.Context) {
+	commentID, err := primitive.ObjectIDFromHex(c.Param("id"))
+	if err != nil {
+		log.Printf("Invalid comment ID: %v", err)
+		c.JSON(400, gin.H{"error": "Invalid comment ID"})
+		return
+	}
+
+	userID, exists := c.Get("user_id")
+	if !exists {
+		log.Printf("User ID not found in context")
+		c.JSON(401, gin.H{"error": "User ID not found"})
+		return
+	}
+
+	username, exists := c.Get("username")
+	if !exists {
+		log.Printf("Username not found in context")
+		c.JSON(401, gin.H{"error": "Username not found"})
+		return
+	}
+
+	log.Printf("Delete comment request - Comment ID: %v, User ID: %v, Username: %v", commentID, userID, username)
+
+	collection := client.Database("forum").Collection("comments")
+
+	// 如果是管理员，直接删除
+	if username.(string) == "admin" {
+		log.Printf("Admin user detected, proceeding with comment deletion")
+		_, err := collection.DeleteOne(context.TODO(), bson.M{"_id": commentID})
+		if err != nil {
+			log.Printf("Error during admin comment deletion: %v", err)
+			c.JSON(500, gin.H{"error": "Failed to delete comment"})
+			return
+		}
+
+		log.Printf("Comment successfully deleted by admin")
+		c.JSON(200, gin.H{"message": "Comment deleted successfully by admin"})
+		return
+	}
+
+	// 非管理员，需要验证评论作者身份
+	var comment Comment
+	err = collection.FindOne(context.TODO(), bson.M{"_id": commentID}).Decode(&comment)
+	if err != nil {
+		log.Printf("Error finding comment: %v", err)
+		c.JSON(404, gin.H{"error": "Comment not found"})
+		return
+	}
+
+	log.Printf("Comment author ID: %v, Current user ID: %v", comment.AuthorID, userID)
+	if comment.AuthorID != userID.(primitive.ObjectID) {
+		log.Printf("User not authorized to delete this comment")
+		c.JSON(403, gin.H{"error": "Not authorized to delete this comment"})
+		return
+	}
+
+	_, err = collection.DeleteOne(context.TODO(), bson.M{"_id": commentID})
+	if err != nil {
+		log.Printf("Error during deletion: %v", err)
+		c.JSON(500, gin.H{"error": "Failed to delete comment"})
+		return
+	}
+
+	log.Printf("Comment successfully deleted by author")
+	c.JSON(200, gin.H{"message": "Comment deleted successfully"})
 }
 
 func getComments(c *gin.Context) {
@@ -251,6 +366,33 @@ func getComments(c *gin.Context) {
 
 	var comments []Comment
 	if err = cursor.All(context.TODO(), &comments); err != nil {
+		c.JSON(500, gin.H{"error": "Failed to decode comments"})
+		return
+	}
+
+	c.JSON(200, comments)
+}
+
+// 在 main.go 中修改 getLatestComments 函数
+func getLatestComments(c *gin.Context) {
+	collection := client.Database("forum").Collection("comments")
+
+	// 获取最新的2条评论
+	opts := options.Find().
+		SetSort(bson.M{"created_at": -1}).
+		SetLimit(2)
+
+	cursor, err := collection.Find(context.TODO(), bson.M{}, opts)
+	if err != nil {
+		log.Printf("Error fetching latest comments: %v", err)
+		c.JSON(500, gin.H{"error": "Failed to fetch comments"})
+		return
+	}
+	defer cursor.Close(context.TODO())
+
+	var comments []Comment
+	if err = cursor.All(context.TODO(), &comments); err != nil {
+		log.Printf("Error decoding comments: %v", err)
 		c.JSON(500, gin.H{"error": "Failed to decode comments"})
 		return
 	}
@@ -292,6 +434,7 @@ func main() {
 
 	// 将现有的 CORS 配置替换为：
 	r.Use(cors.New(cors.Config{
+		//AllowOrigins:   []string{"http://localhost:5173", "http://127.0.0.1:5173"}, // 本地开发环境
 		AllowOrigins:     []string{"https://my-login-app-one.vercel.app"}, // 替换为你的 Vercel 域名
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Length", "Content-Type", "Authorization"},
@@ -326,9 +469,11 @@ func main() {
 		api.POST("/posts", authMiddleware(), createPost)
 		api.PUT("/posts/:id", authMiddleware(), updatePost)
 		api.DELETE("/posts/:id", authMiddleware(), deletePost)
+		api.DELETE("/comments/:id", authMiddleware(), deleteComment)
 
 		// 评论相关
 		api.GET("/posts/:id/comments", getComments)
+		api.GET("/latest-comments", getLatestComments)
 		api.POST("/posts/:id/comments", authMiddleware(), createComment)
 	}
 
