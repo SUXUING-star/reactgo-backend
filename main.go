@@ -196,12 +196,15 @@ func uploadToCloudStorage(file multipart.File, filename string) (string, error) 
 
 // 修改文件上传处理函数
 func HandleFileUpload(c *gin.Context) {
+	log.Println("Starting file upload...")
 	file, err := c.FormFile("file")
 	if err != nil {
 		log.Printf("Error getting form file: %v", err)
 		c.JSON(400, gin.H{"error": "No file uploaded"})
 		return
 	}
+
+	log.Printf("Received file: %s, size: %d", file.Filename, file.Size)
 
 	// 生成唯一文件名
 	filename := time.Now().Format("20060102150405") + "_" + file.Filename
@@ -216,20 +219,27 @@ func HandleFileUpload(c *gin.Context) {
 	}
 	defer src.Close()
 
-	// 上传到阿里云OSS
-	bucket := cloudStorage.bucket
-	if bucket == nil {
-		log.Printf("Error: OSS bucket is nil")
+	log.Printf("Attempting to upload file to OSS bucket: %s, object key: %s",
+		os.Getenv("OSS_BUCKET"), objectKey)
+
+	// 检查 cloudStorage 是否正确初始化
+	if cloudStorage == nil {
+		log.Printf("Error: cloudStorage is nil")
 		c.JSON(500, gin.H{"error": "Storage not initialized"})
 		return
 	}
 
-	// 添加详细的错误处理和日志
-	log.Printf("Uploading file %s to OSS bucket %s", filename, os.Getenv("OSS_BUCKET"))
-	err = bucket.PutObject(objectKey, src)
+	if cloudStorage.bucket == nil {
+		log.Printf("Error: bucket is nil")
+		c.JSON(500, gin.H{"error": "Bucket not initialized"})
+		return
+	}
+
+	// 上传到阿里云OSS
+	err = cloudStorage.bucket.PutObject(objectKey, src)
 	if err != nil {
 		log.Printf("Error uploading to OSS: %v", err)
-		c.JSON(500, gin.H{"error": "Failed to upload file"})
+		c.JSON(500, gin.H{"error": fmt.Sprintf("Failed to upload file: %v", err)})
 		return
 	}
 
@@ -239,7 +249,17 @@ func HandleFileUpload(c *gin.Context) {
 		os.Getenv("OSS_ENDPOINT"),
 		objectKey)
 
-	log.Printf("File uploaded successfully, URL: %s", cloudURL)
+	log.Printf("File uploaded successfully. URL: %s", cloudURL)
+
+	// 验证文件是否可访问
+	resp, err := http.Get(cloudURL)
+	if err != nil {
+		log.Printf("Warning: Could not verify uploaded file: %v", err)
+	} else {
+		resp.Body.Close()
+		log.Printf("File verification status: %d", resp.StatusCode)
+	}
+
 	c.JSON(200, gin.H{"url": cloudURL})
 }
 
