@@ -202,7 +202,7 @@ func HandleFileUpload(c *gin.Context) {
 
 // 迁移现有文件到云存储
 // 在数据库中迁移图片URL
-func migrateImageURLsInDB() {
+func migrateExistingFilesToCloud() {
 	log.Println("Starting database image URLs migration...")
 	collection := client.Database("forum").Collection("posts")
 
