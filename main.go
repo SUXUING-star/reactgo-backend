@@ -11,8 +11,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -486,6 +488,94 @@ func getLatestComments(c *gin.Context) {
 
 	c.JSON(200, comments)
 }
+
+// 图片URL迁移函数
+func migrateImageURLs() {
+	collection := client.Database("forum").Collection("posts")
+
+	// 查找所有带图片的帖子
+	cursor, err := collection.Find(context.TODO(), bson.M{
+		"imageURL": bson.M{"$exists": true, "$ne": ""},
+	})
+	if err != nil {
+		log.Printf("Error finding posts: %v", err)
+		return
+	}
+	defer cursor.Close(context.TODO())
+
+	var posts []Post
+	if err = cursor.All(context.TODO(), &posts); err != nil {
+		log.Printf("Error decoding posts: %v", err)
+		return
+	}
+
+	log.Printf("Found %d posts with images to migrate", len(posts))
+
+	// 更新每个帖子的图片URL
+	for _, post := range posts {
+		oldImageURL := post.ImageURL
+
+		// 如果图片URL不是以 /uploads 开头，进行迁移
+		if !strings.HasPrefix(post.ImageURL, "/uploads/") {
+			// 生成新的文件名保持原始文件名
+			newImageURL := "/uploads/" + filepath.Base(post.ImageURL)
+
+			// 创建物理文件迁移
+			oldFilePath := strings.TrimPrefix(oldImageURL, "/")
+			newFilePath := strings.TrimPrefix(newImageURL, "/")
+
+			// 确保目标目录存在
+			if err := os.MkdirAll("uploads", 0755); err != nil {
+				log.Printf("Error creating uploads directory: %v", err)
+				continue
+			}
+
+			// 复制文件
+			if err := copyFile(oldFilePath, newFilePath); err != nil {
+				log.Printf("Error copying file from %s to %s: %v", oldFilePath, newFilePath, err)
+				continue
+			}
+
+			// 更新数据库记录
+			_, err := collection.UpdateOne(
+				context.TODO(),
+				bson.M{"_id": post.ID},
+				bson.M{"$set": bson.M{"imageURL": newImageURL}},
+			)
+			if err != nil {
+				log.Printf("Error updating post %s: %v", post.ID, err)
+				continue
+			}
+
+			log.Printf("Successfully migrated image for post %s: %s -> %s",
+				post.ID, oldImageURL, newImageURL)
+		}
+	}
+	log.Printf("Image migration completed")
+}
+
+// 辅助函数：复制文件
+func copyFile(src, dst string) error {
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("error opening source file: %v", err)
+	}
+	defer sourceFile.Close()
+
+	destFile, err := os.Create(dst)
+	if err != nil {
+		return fmt.Errorf("error creating destination file: %v", err)
+	}
+	defer destFile.Close()
+
+	_, err = io.Copy(destFile, sourceFile)
+	if err != nil {
+		return fmt.Errorf("error copying file: %v", err)
+	}
+
+	return nil
+}
+
 func main() {
 	// 连接MongoDB
 	mongoURI := os.Getenv("MONGODB_URI")
@@ -508,6 +598,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// 执行图片迁移
+	log.Println("Starting image URL migration...")
+	migrateImageURLs()
 
 	// 初始化Gin路由
 	r := gin.Default()
@@ -549,9 +642,10 @@ func main() {
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
 	}))
-	// 创建上传目录
-	if err := os.MkdirAll("uploads", 0755); err != nil {
-		log.Fatal(err)
+	// Create uploads directory if it doesn't exist
+	uploadsDir := "./uploads"
+	if err := os.MkdirAll(uploadsDir, 0755); err != nil {
+		log.Printf("Error creating uploads directory: %v", err)
 	}
 
 	// 静态文件服务
