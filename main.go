@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -303,74 +304,42 @@ func deletePost(c *gin.Context) {
 		return
 	}
 
-	// 创建一个会话来处理删除操作
-	session, err := client.StartSession()
-	if err != nil {
-		log.Printf("Error starting session: %v", err)
-		c.JSON(500, gin.H{"error": "Internal server error"})
-		return
-	}
-	defer session.EndSession(context.TODO())
+	collection := client.Database("forum").Collection("posts")
+	commentsCollection := client.Database("forum").Collection("comments")
 
-	// 在事务中执行删除操作
-	err = session.StartTransaction()
-	if err != nil {
-		log.Printf("Error starting transaction: %v", err)
-		c.JSON(500, gin.H{"error": "Internal server error"})
-		return
-	}
-
-	callback := func(sessionContext mongo.SessionContext) (interface{}, error) {
-		collection := client.Database("forum").Collection("posts")
-		commentsCollection := client.Database("forum").Collection("comments")
-
-		// 检查是否是管理员或帖子作者
-		if username.(string) != "admin" {
-			var post Post
-			err = collection.FindOne(sessionContext, bson.M{"_id": postID}).Decode(&post)
-			if err != nil {
-				return nil, err
-			}
-
-			if post.AuthorID != userID.(primitive.ObjectID) {
-				return nil, fmt.Errorf("not authorized to delete this post")
-			}
-		}
-
-		// 删除帖子
-		_, err := collection.DeleteOne(sessionContext, bson.M{"_id": postID})
+	// 检查权限
+	if username.(string) != "admin" {
+		var post Post
+		err = collection.FindOne(context.TODO(), bson.M{"_id": postID}).Decode(&post)
 		if err != nil {
-			return nil, err
+			c.JSON(404, gin.H{"error": "Post not found"})
+			return
 		}
 
-		// 删除所有相关评论（包括回复）
-		_, err = commentsCollection.DeleteMany(sessionContext, bson.M{
-			"$or": []bson.M{
-				{"post_id": postID},
-				{"parent_id": bson.M{"$exists": true}},
-			},
-		})
-		if err != nil {
-			return nil, err
-		}
-
-		return nil, nil
-	}
-
-	// 执行事务
-	_, err = session.WithTransaction(context.TODO(), callback) // 直接使用已声明的 err
-	if err != nil {
-		log.Printf("Transaction failed: %v", err)
-		if err.Error() == "not authorized to delete this post" {
+		if post.AuthorID != userID.(primitive.ObjectID) {
 			c.JSON(403, gin.H{"error": "Not authorized to delete this post"})
-		} else {
-			c.JSON(500, gin.H{"error": "Failed to delete post and comments"})
+			return
 		}
+	}
+
+	// 删除帖子
+	_, err = collection.DeleteOne(context.TODO(), bson.M{"_id": postID})
+	if err != nil {
+		log.Printf("Error deleting post: %v", err)
+		c.JSON(500, gin.H{"error": "Failed to delete post"})
+		return
+	}
+
+	// 删除所有相关评论
+	_, err = commentsCollection.DeleteMany(context.TODO(), bson.M{"post_id": postID})
+	if err != nil {
+		log.Printf("Error deleting comments: %v", err)
+		// 即使删除评论失败，帖子已经删除，所以仍然返回成功
+		c.JSON(200, gin.H{"message": "Post deleted but failed to delete some comments"})
 		return
 	}
 
 	c.JSON(200, gin.H{"message": "Post and all related comments deleted successfully"})
-
 }
 
 // 修改 deleteComment 函数，不使用事务
@@ -434,66 +403,61 @@ func getComments(c *gin.Context) {
 
 	collection := client.Database("forum").Collection("comments")
 
-	// 先获取所有主评论（没有 parent_id 的评论）
-	mainCommentsPipeline := mongo.Pipeline{
-		bson.D{{
-			Key: "$match",
-			Value: bson.D{
-				{Key: "post_id", Value: postID},
-				{Key: "parent_id", Value: bson.M{"$exists": false}},
-			},
-		}},
-		bson.D{{
-			Key:   "$sort",
-			Value: bson.D{{Key: "created_at", Value: -1}},
-		}},
-	}
-
-	mainCursor, err := collection.Aggregate(context.TODO(), mainCommentsPipeline)
+	// 获取所有评论
+	cursor, err := collection.Find(context.TODO(), bson.M{"post_id": postID})
 	if err != nil {
 		c.JSON(500, gin.H{"error": "Failed to fetch comments"})
 		return
 	}
-	defer mainCursor.Close(context.TODO())
+	defer cursor.Close(context.TODO())
 
-	var mainComments []Comment
-	if err = mainCursor.All(context.TODO(), &mainComments); err != nil {
+	var allComments []Comment
+	if err = cursor.All(context.TODO(), &allComments); err != nil {
 		c.JSON(500, gin.H{"error": "Failed to decode comments"})
 		return
 	}
 
-	// 对每个主评论，获取其回复
-	for i := range mainComments {
-		repliesPipeline := mongo.Pipeline{
-			bson.D{{
-				Key: "$match",
-				Value: bson.D{{
-					Key:   "parent_id",
-					Value: mainComments[i].ID,
-				}},
-			}},
-			bson.D{{
-				Key:   "$sort",
-				Value: bson.D{{Key: "created_at", Value: 1}},
-			}},
-		}
+	// 构建评论树
+	commentMap := make(map[string]*Comment)
+	var rootComments []*Comment
 
-		repliesCursor, err := collection.Aggregate(context.TODO(), repliesPipeline)
-		if err != nil {
-			continue
-		}
-		defer repliesCursor.Close(context.TODO())
+	// 分离主评论和回复
+	for i := range allComments {
+		comment := &allComments[i]
+		commentMap[comment.ID.Hex()] = comment
 
-		var replies []Comment
-		if err = repliesCursor.All(context.TODO(), &replies); err != nil {
-			continue
+		// 如果是主评论（没有 parent_id）
+		if comment.ParentID.IsZero() {
+			comment.Replies = []Comment{} // 初始化回复数组
+			rootComments = append(rootComments, comment)
 		}
-
-		// 将回复添加到主评论中
-		mainComments[i].Replies = replies
 	}
 
-	c.JSON(200, mainComments)
+	// 将回复添加到对应的主评论下
+	for _, comment := range allComments {
+		if !comment.ParentID.IsZero() {
+			if parent, exists := commentMap[comment.ParentID.Hex()]; exists {
+				parent.Replies = append(parent.Replies, comment)
+			}
+		}
+	}
+
+	// 转换为可以序列化的格式
+	result := make([]Comment, len(rootComments))
+	for i, comment := range rootComments {
+		// 按时间排序回复
+		sort.Slice(comment.Replies, func(i, j int) bool {
+			return comment.Replies[i].CreatedAt.Before(comment.Replies[j].CreatedAt)
+		})
+		result[i] = *comment
+	}
+
+	// 按时间倒序排序主评论
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].CreatedAt.After(result[j].CreatedAt)
+	})
+
+	c.JSON(200, result)
 }
 
 // 在 main.go 中修改 getLatestComments 函数
