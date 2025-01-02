@@ -28,7 +28,20 @@ import (
 
 var client *mongo.Client
 var jwtSecret = []byte(os.Getenv("JWT_SECRET")) // 使用全局变量，并初始化
+// 在文件顶部其他结构体定义的地方添加
+type CommentWithPost struct {
+	ID        primitive.ObjectID `bson:"_id,omitempty" json:"_id"`
+	PostID    primitive.ObjectID `bson:"post_id" json:"post_id"`
+	Content   string             `bson:"content" json:"content"`
+	AuthorID  primitive.ObjectID `bson:"author_id" json:"author_id"`
+	Author    string             `bson:"author" json:"author"`
+	CreatedAt time.Time          `bson:"created_at" json:"created_at"`
+	Post      PostInfo           `json:"post" bson:"post"`
+}
 
+type PostInfo struct {
+	Title string `json:"title" bson:"title"`
+}
 type User struct {
 	ID             primitive.ObjectID `bson:"_id,omitempty" json:"id"`
 	Username       string             `bson:"username" json:"username"`
@@ -38,6 +51,7 @@ type User struct {
 	VerifyToken    string             `bson:"verify_token" json:"verify_token"` // Make sure this field exists
 	TokenExpiredAt time.Time          `bson:"token_expired_at" json:"token_expired_at"`
 	CreatedAt      time.Time          `bson:"created_at" json:"created_at"`
+	Post           PostInfo           `json:"post"`
 }
 
 type Claims struct {
@@ -67,13 +81,17 @@ type Post struct {
 	ImageURL      string             `bson:"image_url" json:"imageURL"` // 修改这里
 }
 
+// 修改 Comment 结构体，保留其他字段不变
 type Comment struct {
-	ID        primitive.ObjectID `bson:"_id,omitempty"`
-	PostID    primitive.ObjectID `bson:"post_id"`
-	Content   string             `bson:"content"`
-	AuthorID  primitive.ObjectID `bson:"author_id"`
-	Author    string             `bson:"author"`
-	CreatedAt time.Time          `bson:"created_at"`
+	ID        primitive.ObjectID   `bson:"_id,omitempty" json:"_id"`
+	PostID    primitive.ObjectID   `bson:"post_id" json:"post_id"`
+	Content   string               `bson:"content" json:"content"`
+	AuthorID  primitive.ObjectID   `bson:"author_id" json:"author_id"`
+	Author    string               `bson:"author" json:"author"`
+	CreatedAt time.Time            `bson:"created_at" json:"created_at"`
+	ParentID  primitive.ObjectID   `bson:"parent_id,omitempty" json:"parent_id,omitempty"`
+	Likes     []primitive.ObjectID `bson:"likes,omitempty" json:"likes,omitempty"`
+	Replies   []Comment            `bson:"replies,omitempty" json:"replies"`
 }
 
 // main.go
@@ -127,14 +145,10 @@ func getUserPosts(c *gin.Context) {
 	}
 
 	log.Printf("Fetching posts for user ID: %v", userID)
-
 	collection := client.Database("forum").Collection("posts")
 
-	// 添加调试日志：打印查询条件
-	log.Printf("Searching posts with query: %+v", bson.M{"author": userID})
-
-	// 使用author字段而不是author_id
-	cursor, err := collection.Find(context.TODO(), bson.M{"author": userID})
+	// 修改查询条件：使用 author_id 而不是 author
+	cursor, err := collection.Find(context.TODO(), bson.M{"author_id": userID})
 	if err != nil {
 		log.Printf("Error fetching posts: %v", err)
 		c.JSON(500, gin.H{"error": "Failed to fetch posts"})
@@ -149,15 +163,7 @@ func getUserPosts(c *gin.Context) {
 		return
 	}
 
-	// 打印找到的帖子信息
-	for _, post := range posts {
-		log.Printf("Found post: ID=%v, Title=%v, Author=%v", post.ID, post.Title, post.Author)
-	}
-
-	if posts == nil {
-		posts = []Post{}
-	}
-
+	log.Printf("Found %d posts for user %v", len(posts), userID)
 	c.JSON(200, posts)
 }
 
@@ -172,8 +178,29 @@ func getUserComments(c *gin.Context) {
 	log.Printf("Fetching comments for user ID: %v", userID)
 
 	collection := client.Database("forum").Collection("comments")
-	// 使用author字段而不是author_id
-	cursor, err := collection.Find(context.TODO(), bson.M{"author": userID})
+
+	// 定义聚合管道，使用显式的字段名
+	pipeline := mongo.Pipeline{
+		{{Key: "$match", Value: bson.D{{Key: "author_id", Value: userID}}}},
+		{{Key: "$lookup", Value: bson.D{
+			{Key: "from", Value: "posts"},
+			{Key: "localField", Value: "post_id"},
+			{Key: "foreignField", Value: "_id"},
+			{Key: "as", Value: "post_info"},
+		}}},
+		{{Key: "$addFields", Value: bson.D{
+			{Key: "post", Value: bson.D{
+				{Key: "title", Value: bson.D{
+					{Key: "$arrayElemAt", Value: []interface{}{"$post_info.title", 0}},
+				}},
+			}},
+		}}},
+		{{Key: "$project", Value: bson.D{
+			{Key: "post_info", Value: 0},
+		}}},
+	}
+
+	cursor, err := collection.Aggregate(context.TODO(), pipeline)
 	if err != nil {
 		log.Printf("Error fetching comments: %v", err)
 		c.JSON(500, gin.H{"error": "Failed to fetch comments"})
@@ -181,17 +208,14 @@ func getUserComments(c *gin.Context) {
 	}
 	defer cursor.Close(context.TODO())
 
-	var comments []Comment
+	var comments []CommentWithPost
 	if err = cursor.All(context.TODO(), &comments); err != nil {
 		log.Printf("Error decoding comments: %v", err)
 		c.JSON(500, gin.H{"error": "Failed to decode comments"})
 		return
 	}
 
-	if comments == nil {
-		comments = []Comment{}
-	}
-
+	log.Printf("Found %d comments", len(comments))
 	c.JSON(200, comments)
 }
 
@@ -278,63 +302,78 @@ func deletePost(c *gin.Context) {
 		c.JSON(401, gin.H{"error": "Username not found"})
 		return
 	}
-	collection := client.Database("forum").Collection("posts")
 
-	// 如果是管理员，不需要检查作者，直接删除
-	if username.(string) == "admin" {
-		log.Printf("Admin user detected, proceeding with deletion")
-		_, err := collection.DeleteOne(context.TODO(), bson.M{"_id": postID})
-		if err != nil {
-			log.Printf("Error during admin deletion: %v", err)
-			c.JSON(500, gin.H{"error": "Failed to delete post"})
-			return
-		}
+	// 创建一个会话来处理删除操作
+	session, err := client.StartSession()
+	if err != nil {
+		log.Printf("Error starting session: %v", err)
+		c.JSON(500, gin.H{"error": "Internal server error"})
+		return
+	}
+	defer session.EndSession(context.TODO())
 
-		// 删除相关评论
+	// 在事务中执行删除操作
+	err = session.StartTransaction()
+	if err != nil {
+		log.Printf("Error starting transaction: %v", err)
+		c.JSON(500, gin.H{"error": "Internal server error"})
+		return
+	}
+
+	callback := func(sessionContext mongo.SessionContext) (interface{}, error) {
+		collection := client.Database("forum").Collection("posts")
 		commentsCollection := client.Database("forum").Collection("comments")
-		_, err = commentsCollection.DeleteMany(context.TODO(), bson.M{"post_id": postID})
-		if err != nil {
-			log.Printf("Error deleting comments: %v", err)
+
+		// 检查是否是管理员或帖子作者
+		if username.(string) != "admin" {
+			var post Post
+			err = collection.FindOne(sessionContext, bson.M{"_id": postID}).Decode(&post)
+			if err != nil {
+				return nil, err
+			}
+
+			if post.AuthorID != userID.(primitive.ObjectID) {
+				return nil, fmt.Errorf("not authorized to delete this post")
+			}
 		}
 
-		log.Printf("Post successfully deleted by admin")
-		c.JSON(200, gin.H{"message": "Post deleted successfully by admin"})
-		return
+		// 删除帖子
+		_, err := collection.DeleteOne(sessionContext, bson.M{"_id": postID})
+		if err != nil {
+			return nil, err
+		}
+
+		// 删除所有相关评论（包括回复）
+		_, err = commentsCollection.DeleteMany(sessionContext, bson.M{
+			"$or": []bson.M{
+				{"post_id": postID},
+				{"parent_id": bson.M{"$exists": true}},
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		return nil, nil
 	}
 
-	// 非管理员，需要验证作者身份
-	var post Post
-	err = collection.FindOne(context.TODO(), bson.M{"_id": postID}).Decode(&post)
+	// 执行事务
+	_, err = session.WithTransaction(context.TODO(), callback) // 直接使用已声明的 err
 	if err != nil {
-		log.Printf("Error finding post: %v", err)
-		c.JSON(404, gin.H{"error": "Post not found"})
+		log.Printf("Transaction failed: %v", err)
+		if err.Error() == "not authorized to delete this post" {
+			c.JSON(403, gin.H{"error": "Not authorized to delete this post"})
+		} else {
+			c.JSON(500, gin.H{"error": "Failed to delete post and comments"})
+		}
 		return
 	}
 
-	log.Printf("Post author ID: %v, Current user ID: %v", post.AuthorID, userID)
-	if post.AuthorID != userID.(primitive.ObjectID) {
-		log.Printf("User not authorized to delete this post")
-		c.JSON(403, gin.H{"error": "Not authorized to delete this post"})
-		return
-	}
+	c.JSON(200, gin.H{"message": "Post and all related comments deleted successfully"})
 
-	_, err = collection.DeleteOne(context.TODO(), bson.M{"_id": postID})
-	if err != nil {
-		log.Printf("Error during deletion: %v", err)
-		c.JSON(500, gin.H{"error": "Failed to delete post"})
-		return
-	}
-
-	// 删除相关评论
-	commentsCollection := client.Database("forum").Collection("comments")
-	_, err = commentsCollection.DeleteMany(context.TODO(), bson.M{"post_id": postID})
-	if err != nil {
-		log.Printf("Error deleting comments: %v", err)
-	}
-
-	log.Printf("Post successfully deleted by author")
-	c.JSON(200, gin.H{"message": "Post deleted successfully"})
 }
+
+// 修改 deleteComment 函数，不使用事务
 func deleteComment(c *gin.Context) {
 	commentID, err := primitive.ObjectIDFromHex(c.Param("id"))
 	if err != nil {
@@ -345,64 +384,47 @@ func deleteComment(c *gin.Context) {
 
 	userID, exists := c.Get("user_id")
 	if !exists {
-		log.Printf("User ID not found in context")
 		c.JSON(401, gin.H{"error": "User ID not found"})
 		return
 	}
 
-	username, exists := c.Get("username")
-	if !exists {
-		log.Printf("Username not found in context")
-		c.JSON(401, gin.H{"error": "Username not found"})
-		return
-	}
-
-	log.Printf("Delete comment request - Comment ID: %v, User ID: %v, Username: %v", commentID, userID, username)
-
+	username, _ := c.Get("username")
 	collection := client.Database("forum").Collection("comments")
 
-	// 如果是管理员，直接删除
-	if username.(string) == "admin" {
-		log.Printf("Admin user detected, proceeding with comment deletion")
-		_, err := collection.DeleteOne(context.TODO(), bson.M{"_id": commentID})
+	// 如果不是管理员，检查是否是评论作者
+	if username.(string) != "admin" {
+		var comment Comment
+		err = collection.FindOne(context.TODO(), bson.M{"_id": commentID}).Decode(&comment)
 		if err != nil {
-			log.Printf("Error during admin comment deletion: %v", err)
-			c.JSON(500, gin.H{"error": "Failed to delete comment"})
+			c.JSON(404, gin.H{"error": "Comment not found"})
 			return
 		}
 
-		log.Printf("Comment successfully deleted by admin")
-		c.JSON(200, gin.H{"message": "Comment deleted successfully by admin"})
-		return
+		if comment.AuthorID != userID.(primitive.ObjectID) {
+			c.JSON(403, gin.H{"error": "Not authorized to delete this comment"})
+			return
+		}
 	}
 
-	// 非管理员，需要验证评论作者身份
-	var comment Comment
-	err = collection.FindOne(context.TODO(), bson.M{"_id": commentID}).Decode(&comment)
+	// 删除评论及其所有回复
+	_, err = collection.DeleteMany(context.TODO(), bson.M{
+		"$or": []bson.M{
+			{"_id": commentID},
+			{"parent_id": commentID},
+		},
+	})
+
 	if err != nil {
-		log.Printf("Error finding comment: %v", err)
-		c.JSON(404, gin.H{"error": "Comment not found"})
-		return
-	}
-
-	log.Printf("Comment author ID: %v, Current user ID: %v", comment.AuthorID, userID)
-	if comment.AuthorID != userID.(primitive.ObjectID) {
-		log.Printf("User not authorized to delete this comment")
-		c.JSON(403, gin.H{"error": "Not authorized to delete this comment"})
-		return
-	}
-
-	_, err = collection.DeleteOne(context.TODO(), bson.M{"_id": commentID})
-	if err != nil {
-		log.Printf("Error during deletion: %v", err)
+		log.Printf("Error deleting comment: %v", err)
 		c.JSON(500, gin.H{"error": "Failed to delete comment"})
 		return
 	}
 
-	log.Printf("Comment successfully deleted by author")
-	c.JSON(200, gin.H{"message": "Comment deleted successfully"})
+	c.JSON(200, gin.H{"message": "Comment and replies deleted successfully"})
 }
 
+// 修改获取评论的函数以支持嵌套结构
+// 修改 getComments 函数以支持嵌套结构和排序
 func getComments(c *gin.Context) {
 	postID, err := primitive.ObjectIDFromHex(c.Param("id"))
 	if err != nil {
@@ -411,20 +433,67 @@ func getComments(c *gin.Context) {
 	}
 
 	collection := client.Database("forum").Collection("comments")
-	cursor, err := collection.Find(context.TODO(), bson.M{"post_id": postID})
+
+	// 先获取所有主评论（没有 parent_id 的评论）
+	mainCommentsPipeline := mongo.Pipeline{
+		bson.D{{
+			Key: "$match",
+			Value: bson.D{
+				{Key: "post_id", Value: postID},
+				{Key: "parent_id", Value: bson.M{"$exists": false}},
+			},
+		}},
+		bson.D{{
+			Key:   "$sort",
+			Value: bson.D{{Key: "created_at", Value: -1}},
+		}},
+	}
+
+	mainCursor, err := collection.Aggregate(context.TODO(), mainCommentsPipeline)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "Failed to fetch comments"})
 		return
 	}
-	defer cursor.Close(context.TODO())
+	defer mainCursor.Close(context.TODO())
 
-	var comments []Comment
-	if err = cursor.All(context.TODO(), &comments); err != nil {
+	var mainComments []Comment
+	if err = mainCursor.All(context.TODO(), &mainComments); err != nil {
 		c.JSON(500, gin.H{"error": "Failed to decode comments"})
 		return
 	}
 
-	c.JSON(200, comments)
+	// 对每个主评论，获取其回复
+	for i := range mainComments {
+		repliesPipeline := mongo.Pipeline{
+			bson.D{{
+				Key: "$match",
+				Value: bson.D{{
+					Key:   "parent_id",
+					Value: mainComments[i].ID,
+				}},
+			}},
+			bson.D{{
+				Key:   "$sort",
+				Value: bson.D{{Key: "created_at", Value: 1}},
+			}},
+		}
+
+		repliesCursor, err := collection.Aggregate(context.TODO(), repliesPipeline)
+		if err != nil {
+			continue
+		}
+		defer repliesCursor.Close(context.TODO())
+
+		var replies []Comment
+		if err = repliesCursor.All(context.TODO(), &replies); err != nil {
+			continue
+		}
+
+		// 将回复添加到主评论中
+		mainComments[i].Replies = replies
+	}
+
+	c.JSON(200, mainComments)
 }
 
 // 在 main.go 中修改 getLatestComments 函数
@@ -550,6 +619,10 @@ func main() {
 		api.GET("/posts/:id/comments", getComments)
 		api.GET("/latest-comments", getLatestComments)
 		api.POST("/posts/:id/comments", authMiddleware(), createComment)
+
+		api.POST("/comments/:id/reply", authMiddleware(), handleReply)
+		api.POST("/comments/:id/like", authMiddleware(), handleLike)
+		api.DELETE("/comments/:id/like", authMiddleware(), handleUnlike)
 	}
 
 	port := os.Getenv("PORT")
@@ -935,44 +1008,60 @@ func getPosts(c *gin.Context) {
 func getPost(c *gin.Context) {
 	id, err := primitive.ObjectIDFromHex(c.Param("id"))
 	if err != nil {
-		log.Printf("Invalid post ID: %v", err)
 		c.JSON(400, gin.H{"error": "Invalid post ID"})
 		return
 	}
 
-	log.Printf("Fetching post with ID: %s", id.Hex())
-
 	collection := client.Database("forum").Collection("posts")
+	commentsCollection := client.Database("forum").Collection("comments")
+
+	// 获取帖子信息
 	var post Post
 	err = collection.FindOne(context.TODO(), bson.M{"_id": id}).Decode(&post)
 	if err != nil {
-		log.Printf("Error finding post: %v", err)
 		c.JSON(404, gin.H{"error": "Post not found"})
 		return
 	}
 
-	// 获取评论
-	commentsCollection := client.Database("forum").Collection("comments")
-	cursor, err := commentsCollection.Find(context.TODO(), bson.M{"post_id": id})
+	// 先获取主评论
+	mainCommentsFilter := bson.M{
+		"post_id":   id,
+		"parent_id": bson.M{"$exists": false}, // 只获取主评论
+	}
+	mainCommentsCursor, err := commentsCollection.Find(context.TODO(), mainCommentsFilter)
 	if err != nil {
-		log.Printf("Error fetching comments: %v", err)
 		c.JSON(500, gin.H{"error": "Failed to fetch comments"})
 		return
 	}
-	defer cursor.Close(context.TODO())
+	defer mainCommentsCursor.Close(context.TODO())
 
-	var comments []Comment
-	if err = cursor.All(context.TODO(), &comments); err != nil {
-		log.Printf("Error decoding comments: %v", err)
+	var mainComments []Comment
+	if err = mainCommentsCursor.All(context.TODO(), &mainComments); err != nil {
 		c.JSON(500, gin.H{"error": "Failed to decode comments"})
 		return
 	}
 
-	log.Printf("Successfully fetched post and %d comments", len(comments))
+	// 获取每个主评论的回复
+	for i := range mainComments {
+		repliesFilter := bson.M{"parent_id": mainComments[i].ID}
+		repliesCursor, err := commentsCollection.Find(context.TODO(), repliesFilter)
+		if err != nil {
+			continue
+		}
+		defer repliesCursor.Close(context.TODO())
 
+		var replies []Comment
+		if err = repliesCursor.All(context.TODO(), &replies); err != nil {
+			continue
+		}
+
+		mainComments[i].Replies = replies
+	}
+
+	// 返回帖子和评论数据
 	c.JSON(200, gin.H{
 		"post":     post,
-		"comments": comments,
+		"comments": mainComments,
 	})
 }
 
@@ -1070,4 +1159,109 @@ func createComment(c *gin.Context) {
 	}
 
 	c.JSON(201, gin.H{"id": result.InsertedID})
+}
+
+func handleReply(c *gin.Context) {
+	parentID, err := primitive.ObjectIDFromHex(c.Param("id"))
+	if err != nil {
+		c.JSON(400, gin.H{"error": "Invalid comment ID"})
+		return
+	}
+
+	collection := client.Database("forum").Collection("comments")
+
+	// 获取父评论信息
+	var parentComment Comment
+	err = collection.FindOne(context.TODO(), bson.M{"_id": parentID}).Decode(&parentComment)
+	if err != nil {
+		c.JSON(404, gin.H{"error": "Parent comment not found"})
+		return
+	}
+
+	userID, _ := c.Get("user_id")
+	username, _ := c.Get("username")
+
+	var input struct {
+		Content string `json:"content"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(400, gin.H{"error": "Invalid content"})
+		return
+	}
+
+	reply := Comment{
+		ID:        primitive.NewObjectID(),
+		PostID:    parentComment.PostID,
+		Content:   input.Content,
+		AuthorID:  userID.(primitive.ObjectID),
+		Author:    username.(string),
+		CreatedAt: time.Now(),
+		ParentID:  parentID,
+	}
+
+	_, err = collection.InsertOne(context.TODO(), reply)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to create reply"})
+		return
+	}
+
+	c.JSON(201, reply)
+}
+
+// 处理点赞
+func handleLike(c *gin.Context) {
+	commentID, err := primitive.ObjectIDFromHex(c.Param("id"))
+	if err != nil {
+		c.JSON(400, gin.H{"error": "Invalid comment ID"})
+		return
+	}
+
+	userID, _ := c.Get("user_id")
+	collection := client.Database("forum").Collection("comments")
+
+	_, err = collection.UpdateOne(
+		context.TODO(),
+		bson.M{"_id": commentID},
+		bson.M{
+			"$addToSet": bson.M{
+				"likes": userID.(primitive.ObjectID),
+			},
+		},
+	)
+
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to like comment"})
+		return
+	}
+
+	c.JSON(200, gin.H{"message": "Comment liked successfully"})
+}
+
+// 处理取消点赞
+func handleUnlike(c *gin.Context) {
+	commentID, err := primitive.ObjectIDFromHex(c.Param("id"))
+	if err != nil {
+		c.JSON(400, gin.H{"error": "Invalid comment ID"})
+		return
+	}
+
+	userID, _ := c.Get("user_id")
+	collection := client.Database("forum").Collection("comments")
+
+	_, err = collection.UpdateOne(
+		context.TODO(),
+		bson.M{"_id": commentID},
+		bson.M{
+			"$pull": bson.M{
+				"likes": userID.(primitive.ObjectID),
+			},
+		},
+	)
+
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to unlike comment"})
+		return
+	}
+
+	c.JSON(200, gin.H{"message": "Comment unliked successfully"})
 }
