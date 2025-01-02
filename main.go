@@ -133,28 +133,42 @@ func init() {
 }
 
 // 初始化云存储
+// 确保初始化时正确设置了OSS客户端
 func initCloudStorage() error {
-	cloudStorage = &CloudStorage{
-		AccessKeyID:     os.Getenv("OSS_ACCESS_KEY_ID"),
-		AccessKeySecret: os.Getenv("OSS_ACCESS_KEY_SECRET"),
-		Endpoint:        os.Getenv("OSS_ENDPOINT"),
-		BucketName:      os.Getenv("OSS_BUCKET"),
+	// 检查环境变量
+	required := []string{"OSS_ACCESS_KEY_ID", "OSS_ACCESS_KEY_SECRET", "OSS_ENDPOINT", "OSS_BUCKET"}
+	for _, env := range required {
+		if os.Getenv(env) == "" {
+			return fmt.Errorf("missing required environment variable: %s", env)
+		}
 	}
 
-	// 创建OSSClient实例
-	client, err := oss.New(cloudStorage.Endpoint, cloudStorage.AccessKeyID, cloudStorage.AccessKeySecret)
+	log.Printf("Initializing OSS client with endpoint: %s, bucket: %s",
+		os.Getenv("OSS_ENDPOINT"),
+		os.Getenv("OSS_BUCKET"))
+
+	// 创建OSS客户端
+	client, err := oss.New(
+		os.Getenv("OSS_ENDPOINT"),
+		os.Getenv("OSS_ACCESS_KEY_ID"),
+		os.Getenv("OSS_ACCESS_KEY_SECRET"),
+	)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create OSS client: %v", err)
 	}
 
 	// 获取存储空间
-	bucket, err := client.Bucket(cloudStorage.BucketName)
+	bucket, err := client.Bucket(os.Getenv("OSS_BUCKET"))
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get bucket: %v", err)
 	}
 
-	cloudStorage.client = client
-	cloudStorage.bucket = bucket
+	cloudStorage = &CloudStorage{
+		client: client,
+		bucket: bucket,
+	}
+
+	log.Println("Cloud storage initialized successfully")
 	return nil
 }
 
@@ -182,21 +196,50 @@ func uploadToCloudStorage(file multipart.File, filename string) (string, error) 
 
 // 修改文件上传处理函数
 func HandleFileUpload(c *gin.Context) {
-	file, header, err := c.Request.FormFile("file")
+	file, err := c.FormFile("file")
 	if err != nil {
+		log.Printf("Error getting form file: %v", err)
 		c.JSON(400, gin.H{"error": "No file uploaded"})
 		return
 	}
-	defer file.Close()
 
-	// 上传到云存储
-	cloudURL, err := uploadToCloudStorage(file, header.Filename)
+	// 生成唯一文件名
+	filename := time.Now().Format("20060102150405") + "_" + file.Filename
+	objectKey := "uploads/" + filename
+
+	// 打开上传的文件
+	src, err := file.Open()
 	if err != nil {
-		log.Printf("Failed to upload to cloud storage: %v", err)
+		log.Printf("Error opening uploaded file: %v", err)
+		c.JSON(500, gin.H{"error": "Failed to open file"})
+		return
+	}
+	defer src.Close()
+
+	// 上传到阿里云OSS
+	bucket := cloudStorage.bucket
+	if bucket == nil {
+		log.Printf("Error: OSS bucket is nil")
+		c.JSON(500, gin.H{"error": "Storage not initialized"})
+		return
+	}
+
+	// 添加详细的错误处理和日志
+	log.Printf("Uploading file %s to OSS bucket %s", filename, os.Getenv("OSS_BUCKET"))
+	err = bucket.PutObject(objectKey, src)
+	if err != nil {
+		log.Printf("Error uploading to OSS: %v", err)
 		c.JSON(500, gin.H{"error": "Failed to upload file"})
 		return
 	}
 
+	// 构造访问URL
+	cloudURL := fmt.Sprintf("https://%s.%s/%s",
+		os.Getenv("OSS_BUCKET"),
+		os.Getenv("OSS_ENDPOINT"),
+		objectKey)
+
+	log.Printf("File uploaded successfully, URL: %s", cloudURL)
 	c.JSON(200, gin.H{"url": cloudURL})
 }
 
@@ -628,9 +671,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	// 初始化云存储
+	log.SetFlags(log.LstdFlags | log.Lshortfile) // 添加文件名和行号到日志
+
+	// 初始化云存储必须在设置路由之前
 	if err := initCloudStorage(); err != nil {
-		log.Printf("Warning: Failed to initialize cloud storage: %v", err)
+		log.Fatalf("Failed to initialize cloud storage: %v", err)
 	}
 	// 执行迁移
 	migrateExistingFilesToCloud()
@@ -687,6 +732,14 @@ func main() {
 	// API路由
 	api := r.Group("/api")
 	{
+		// 添加一个测试路由
+		api.GET("/test-oss", func(c *gin.Context) {
+			if cloudStorage == nil || cloudStorage.bucket == nil {
+				c.JSON(500, gin.H{"error": "Storage not initialized"})
+				return
+			}
+			c.JSON(200, gin.H{"status": "OSS connection OK"})
+		})
 		// 文件上传
 		api.POST("/upload", authMiddleware(), HandleFileUpload)
 		// 用户相关
