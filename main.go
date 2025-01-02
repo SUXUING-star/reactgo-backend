@@ -431,8 +431,9 @@ func updatePost(c *gin.Context) {
 	}
 
 	var updateData struct {
-		Title   string `json:"title"`
-		Content string `json:"content"`
+		Title    string `json:"title"`
+		Content  string `json:"content"`
+		ImageURL string `json:"imageURL"`
 	}
 	if err := c.ShouldBindJSON(&updateData); err != nil {
 		c.JSON(400, gin.H{"error": "Invalid request"})
@@ -441,10 +442,12 @@ func updatePost(c *gin.Context) {
 
 	update := bson.M{
 		"$set": bson.M{
-			"title":   updateData.Title,
-			"content": updateData.Content,
+			"title":     updateData.Title,
+			"content":   updateData.Content,
+			"image_url": updateData.ImageURL,
 		},
 	}
+	log.Printf("Updating post %s with image URL: %s", postID, updateData.ImageURL)
 
 	_, err = collection.UpdateOne(context.TODO(), bson.M{"_id": postID}, update)
 	if err != nil {
