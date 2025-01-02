@@ -12,6 +12,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"time"
@@ -200,11 +201,12 @@ func HandleFileUpload(c *gin.Context) {
 }
 
 // 迁移现有文件到云存储
-func migrateExistingFilesToCloud() {
-	log.Println("Starting migration of existing files to cloud storage...")
+// 在数据库中迁移图片URL
+func migrateImageURLsInDB() {
+	log.Println("Starting database image URLs migration...")
 	collection := client.Database("forum").Collection("posts")
 
-	// 查找所有本地存储的图片记录
+	// 找到所有包含本地路径的帖子
 	cursor, err := collection.Find(context.TODO(), bson.M{
 		"imageURL": bson.M{
 			"$exists": true,
@@ -224,33 +226,16 @@ func migrateExistingFilesToCloud() {
 		return
 	}
 
+	log.Printf("Found %d posts with local image URLs", len(posts))
+
 	for _, post := range posts {
-		// 获取本地文件路径
-		localPath := "." + post.ImageURL // 转换 /uploads/xxx 为 ./uploads/xxx
-
-		// 打开本地文件
-		file, err := os.Open(localPath)
-		if err != nil {
-			log.Printf("Error opening file %s: %v", localPath, err)
-			continue
-		}
-
-		// 获取文件信息
-		fileInfo, err := file.Stat()
-		if err != nil {
-			file.Close()
-			log.Printf("Error getting file info for %s: %v", localPath, err)
-			continue
-		}
-
-		// 上传到云存储
-		cloudURL, err := uploadToCloudStorage(file, fileInfo.Name())
-		if err != nil {
-			file.Close()
-			log.Printf("Error uploading to cloud storage: %v", err)
-			continue
-		}
-		file.Close()
+		// 构造阿里云OSS的URL
+		filename := filepath.Base(post.ImageURL)
+		objectKey := "uploads/" + filename
+		cloudURL := fmt.Sprintf("https://%s.%s/%s",
+			os.Getenv("OSS_BUCKET"),
+			os.Getenv("OSS_ENDPOINT"),
+			objectKey)
 
 		// 更新数据库记录
 		_, err = collection.UpdateOne(
@@ -263,10 +248,11 @@ func migrateExistingFilesToCloud() {
 			continue
 		}
 
-		log.Printf("Successfully migrated file for post %s: %s -> %s",
+		log.Printf("Updated image URL for post %s: %s -> %s",
 			post.ID, post.ImageURL, cloudURL)
 	}
-	log.Println("File migration completed")
+
+	log.Println("Database migration completed")
 }
 
 // 获取用户帖子
@@ -728,6 +714,34 @@ func main() {
 		api.POST("/comments/:id/reply", authMiddleware(), handleReply)
 		api.POST("/comments/:id/like", authMiddleware(), handleLike)
 		api.DELETE("/comments/:id/like", authMiddleware(), handleUnlike)
+
+		// 添加一个检查路由来查看迁移结果
+		api.GET("/check-migration", func(c *gin.Context) {
+			collection := client.Database("forum").Collection("posts")
+
+			cursor, err := collection.Find(context.TODO(), bson.M{
+				"imageURL": bson.M{
+					"$exists": true,
+					"$ne":     "",
+				},
+			})
+			if err != nil {
+				c.JSON(500, gin.H{"error": "Failed to fetch posts"})
+				return
+			}
+			defer cursor.Close(context.TODO())
+
+			var posts []struct {
+				ID       primitive.ObjectID `json:"_id"`
+				ImageURL string             `json:"imageURL"`
+			}
+			if err = cursor.All(context.TODO(), &posts); err != nil {
+				c.JSON(500, gin.H{"error": "Failed to decode posts"})
+				return
+			}
+
+			c.JSON(200, posts)
+		})
 	}
 
 	port := os.Getenv("PORT")
