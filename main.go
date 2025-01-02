@@ -204,8 +204,6 @@ func HandleFileUpload(c *gin.Context) {
 		return
 	}
 
-	log.Printf("Received file: %s, size: %d", file.Filename, file.Size)
-
 	// 生成唯一文件名
 	filename := time.Now().Format("20060102150405") + "_" + file.Filename
 	objectKey := "uploads/" + filename
@@ -219,19 +217,10 @@ func HandleFileUpload(c *gin.Context) {
 	}
 	defer src.Close()
 
-	log.Printf("Attempting to upload file to OSS bucket: %s, object key: %s",
-		os.Getenv("OSS_BUCKET"), objectKey)
-
 	// 检查 cloudStorage 是否正确初始化
-	if cloudStorage == nil {
-		log.Printf("Error: cloudStorage is nil")
+	if cloudStorage == nil || cloudStorage.bucket == nil {
+		log.Printf("Error: Storage not initialized")
 		c.JSON(500, gin.H{"error": "Storage not initialized"})
-		return
-	}
-
-	if cloudStorage.bucket == nil {
-		log.Printf("Error: bucket is nil")
-		c.JSON(500, gin.H{"error": "Bucket not initialized"})
 		return
 	}
 
@@ -239,20 +228,22 @@ func HandleFileUpload(c *gin.Context) {
 	err = cloudStorage.bucket.PutObject(objectKey, src)
 	if err != nil {
 		log.Printf("Error uploading to OSS: %v", err)
-		c.JSON(500, gin.H{"error": fmt.Sprintf("Failed to upload file: %v", err)})
+		c.JSON(500, gin.H{"error": "Failed to upload file"})
 		return
 	}
 
-	// 构造访问URL
+	// 构造正确的访问URL
+	bucketName := os.Getenv("OSS_BUCKET")
 	cloudURL := fmt.Sprintf("https://%s.%s/%s",
-		os.Getenv("OSS_BUCKET"),
-		os.Getenv("OSS_ENDPOINT"),
+		bucketName,
+		"oss-cn-beijing.aliyuncs.com", // 直接使用完整的域名
 		objectKey)
 
 	log.Printf("File uploaded successfully. URL: %s", cloudURL)
 
 	// 验证文件是否可访问
-	resp, err := http.Get(cloudURL)
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(cloudURL)
 	if err != nil {
 		log.Printf("Warning: Could not verify uploaded file: %v", err)
 	} else {
