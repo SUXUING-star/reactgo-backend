@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -125,15 +126,23 @@ func HandleFileUpload(c *gin.Context) {
 		return
 	}
 
-	// 生成唯一文件名
+	// 确保生成统一格式的文件名
 	filename := time.Now().Format("20060102150405") + "_" + file.Filename
-	filepath := "uploads/" + filename
 
+	// 确保上传目录存在
+	if err := os.MkdirAll("uploads", 0755); err != nil {
+		c.JSON(500, gin.H{"error": "Failed to create upload directory"})
+		return
+	}
+
+	// 保存文件
+	filepath := filepath.Join("uploads", filename)
 	if err := c.SaveUploadedFile(file, filepath); err != nil {
 		c.JSON(500, gin.H{"error": "Failed to save file"})
 		return
 	}
 
+	// 返回统一格式的 URL，总是以 /uploads/ 开头
 	c.JSON(200, gin.H{"url": "/uploads/" + filename})
 }
 
@@ -487,6 +496,51 @@ func getLatestComments(c *gin.Context) {
 
 	c.JSON(200, comments)
 }
+
+// 图片URL迁移函数
+func migrateImageURLs() {
+	log.Println("Starting image URL migration...")
+	collection := client.Database("forum").Collection("posts")
+
+	cursor, err := collection.Find(context.TODO(), bson.M{
+		"imageURL": bson.M{"$exists": true, "$ne": ""},
+	})
+	if err != nil {
+		log.Printf("Error finding posts with images: %v", err)
+		return
+	}
+	defer cursor.Close(context.TODO())
+
+	var posts []Post
+	if err = cursor.All(context.TODO(), &posts); err != nil {
+		log.Printf("Error decoding posts: %v", err)
+		return
+	}
+
+	for _, post := range posts {
+		// 如果图片URL不是以 /uploads/ 开头
+		if !strings.HasPrefix(post.ImageURL, "/uploads/") {
+			newImageURL := "/uploads/" + strings.TrimPrefix(
+				strings.TrimPrefix(post.ImageURL, "/"),
+				"uploads/",
+			)
+
+			_, err := collection.UpdateOne(
+				context.TODO(),
+				bson.M{"_id": post.ID},
+				bson.M{"$set": bson.M{"imageURL": newImageURL}},
+			)
+			if err != nil {
+				log.Printf("Error updating image URL for post %s: %v", post.ID, err)
+				continue
+			}
+			log.Printf("Updated image URL for post %s: %s -> %s",
+				post.ID, post.ImageURL, newImageURL)
+		}
+	}
+	log.Println("Image URL migration completed")
+}
+
 func main() {
 	// 连接MongoDB
 	mongoURI := os.Getenv("MONGODB_URI")
@@ -509,6 +563,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// 在设置路由之前执行迁移
+	migrateImageURLs()
 
 	// 初始化Gin路由
 	r := gin.Default()
@@ -557,15 +613,8 @@ func main() {
 	}
 
 	// 静态文件服务
-	r.Static("/uploads", uploadsDir)
-	r.NoRoute(func(c *gin.Context) {
-		if strings.HasPrefix(c.Request.URL.Path, "/uploads/") {
-			log.Printf("File not found: %s", c.Request.URL.Path)
-			c.JSON(404, gin.H{"error": "File not found"})
-			return
-		}
-		c.JSON(404, gin.H{"error": "Route not found"})
-	})
+	r.Static("/uploads", "./uploads")
+
 	// API路由
 	api := r.Group("/api")
 	{
