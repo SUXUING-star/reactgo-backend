@@ -308,6 +308,35 @@ func migrateExistingFilesToCloud() {
 
 	log.Println("Database migration completed")
 }
+func getCommunityStats(c *gin.Context) {
+	var stats struct {
+		TotalPosts    int64 `json:"totalPosts"`
+		TotalUsers    int64 `json:"totalUsers"`
+		TotalComments int64 `json:"totalComments"`
+		ActiveUsers   int64 `json:"activeUsers"`
+	}
+
+	postsCollection := client.Database("forum").Collection("posts")
+	usersCollection := client.Database("forum").Collection("users")
+	commentsCollection := client.Database("forum").Collection("comments")
+
+	// Get total posts
+	stats.TotalPosts, _ = postsCollection.CountDocuments(context.TODO(), bson.M{})
+
+	// Get total users
+	stats.TotalUsers, _ = usersCollection.CountDocuments(context.TODO(), bson.M{})
+
+	// Get total comments
+	stats.TotalComments, _ = commentsCollection.CountDocuments(context.TODO(), bson.M{})
+
+	// Get active users (users who posted in last 30 days)
+	thirtyDaysAgo := time.Now().AddDate(0, 0, -30)
+	stats.ActiveUsers, _ = postsCollection.CountDocuments(context.TODO(), bson.M{
+		"created_at": bson.M{"$gte": thirtyDaysAgo},
+	})
+
+	c.JSON(200, stats)
+}
 
 // 获取用户帖子
 func getUserPosts(c *gin.Context) {
@@ -781,6 +810,8 @@ func main() {
 		api.POST("/comments/:id/reply", authMiddleware(), handleReply)
 		api.POST("/comments/:id/like", authMiddleware(), handleLike)
 		api.DELETE("/comments/:id/like", authMiddleware(), handleUnlike)
+
+		api.GET("/community-stats", getCommunityStats)
 
 		// 添加一个检查路由来查看迁移结果
 		api.GET("/check-migration", func(c *gin.Context) {
