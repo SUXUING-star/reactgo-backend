@@ -9,14 +9,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
-	"path/filepath"
 	"regexp"
 	"sort"
-	"strings"
 	"time"
 
+	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v4"
@@ -31,6 +31,19 @@ import (
 
 var client *mongo.Client
 var jwtSecret = []byte(os.Getenv("JWT_SECRET")) // 使用全局变量，并初始化
+
+// 云存储配置
+type CloudStorage struct {
+	AccessKeyID     string
+	AccessKeySecret string
+	Endpoint        string
+	BucketName      string
+	client          *oss.Client
+	bucket          *oss.Bucket
+}
+
+var cloudStorage *CloudStorage
+
 // 在文件顶部其他结构体定义的地方添加
 type CommentWithPost struct {
 	ID        primitive.ObjectID `bson:"_id,omitempty" json:"_id"`
@@ -118,32 +131,142 @@ func init() {
 	}
 }
 
-// 文件上传处理
+// 初始化云存储
+func initCloudStorage() error {
+	cloudStorage = &CloudStorage{
+		AccessKeyID:     os.Getenv("OSS_ACCESS_KEY_ID"),
+		AccessKeySecret: os.Getenv("OSS_ACCESS_KEY_SECRET"),
+		Endpoint:        os.Getenv("OSS_ENDPOINT"),
+		BucketName:      os.Getenv("OSS_BUCKET"),
+	}
+
+	// 创建OSSClient实例
+	client, err := oss.New(cloudStorage.Endpoint, cloudStorage.AccessKeyID, cloudStorage.AccessKeySecret)
+	if err != nil {
+		return err
+	}
+
+	// 获取存储空间
+	bucket, err := client.Bucket(cloudStorage.BucketName)
+	if err != nil {
+		return err
+	}
+
+	cloudStorage.client = client
+	cloudStorage.bucket = bucket
+	return nil
+}
+
+// 上传文件到云存储
+func uploadToCloudStorage(file multipart.File, filename string) (string, error) {
+	if cloudStorage == nil || cloudStorage.bucket == nil {
+		return "", fmt.Errorf("cloud storage not initialized")
+	}
+
+	// 生成唯一的文件名
+	objectKey := "uploads/" + time.Now().Format("20060102150405") + "_" + filename
+
+	// 上传文件
+	err := cloudStorage.bucket.PutObject(objectKey, file)
+	if err != nil {
+		return "", err
+	}
+
+	// 返回文件的访问URL
+	return fmt.Sprintf("https://%s.%s/%s",
+		cloudStorage.BucketName,
+		cloudStorage.Endpoint,
+		objectKey), nil
+}
+
+// 修改文件上传处理函数
 func HandleFileUpload(c *gin.Context) {
-	file, err := c.FormFile("file")
+	file, header, err := c.Request.FormFile("file")
 	if err != nil {
 		c.JSON(400, gin.H{"error": "No file uploaded"})
 		return
 	}
+	defer file.Close()
 
-	// 确保生成统一格式的文件名
-	filename := time.Now().Format("20060102150405") + "_" + file.Filename
-
-	// 确保上传目录存在
-	if err := os.MkdirAll("uploads", 0755); err != nil {
-		c.JSON(500, gin.H{"error": "Failed to create upload directory"})
+	// 上传到云存储
+	cloudURL, err := uploadToCloudStorage(file, header.Filename)
+	if err != nil {
+		log.Printf("Failed to upload to cloud storage: %v", err)
+		c.JSON(500, gin.H{"error": "Failed to upload file"})
 		return
 	}
 
-	// 保存文件
-	filepath := filepath.Join("uploads", filename)
-	if err := c.SaveUploadedFile(file, filepath); err != nil {
-		c.JSON(500, gin.H{"error": "Failed to save file"})
+	c.JSON(200, gin.H{"url": cloudURL})
+}
+
+// 迁移现有文件到云存储
+func migrateExistingFilesToCloud() {
+	log.Println("Starting migration of existing files to cloud storage...")
+	collection := client.Database("forum").Collection("posts")
+
+	// 查找所有本地存储的图片记录
+	cursor, err := collection.Find(context.TODO(), bson.M{
+		"imageURL": bson.M{
+			"$exists": true,
+			"$ne":     "",
+			"$regex":  "^/uploads/",
+		},
+	})
+	if err != nil {
+		log.Printf("Error finding posts with local images: %v", err)
+		return
+	}
+	defer cursor.Close(context.TODO())
+
+	var posts []Post
+	if err = cursor.All(context.TODO(), &posts); err != nil {
+		log.Printf("Error decoding posts: %v", err)
 		return
 	}
 
-	// 返回统一格式的 URL，总是以 /uploads/ 开头
-	c.JSON(200, gin.H{"url": "/uploads/" + filename})
+	for _, post := range posts {
+		// 获取本地文件路径
+		localPath := "." + post.ImageURL // 转换 /uploads/xxx 为 ./uploads/xxx
+
+		// 打开本地文件
+		file, err := os.Open(localPath)
+		if err != nil {
+			log.Printf("Error opening file %s: %v", localPath, err)
+			continue
+		}
+
+		// 获取文件信息
+		fileInfo, err := file.Stat()
+		if err != nil {
+			file.Close()
+			log.Printf("Error getting file info for %s: %v", localPath, err)
+			continue
+		}
+
+		// 上传到云存储
+		cloudURL, err := uploadToCloudStorage(file, fileInfo.Name())
+		if err != nil {
+			file.Close()
+			log.Printf("Error uploading to cloud storage: %v", err)
+			continue
+		}
+		file.Close()
+
+		// 更新数据库记录
+		_, err = collection.UpdateOne(
+			context.TODO(),
+			bson.M{"_id": post.ID},
+			bson.M{"$set": bson.M{"imageURL": cloudURL}},
+		)
+		if err != nil {
+			log.Printf("Error updating post %s: %v", post.ID, err)
+			continue
+		}
+
+		log.Printf("Successfully migrated file for post %s: %s -> %s",
+			post.ID, post.ImageURL, cloudURL)
+	}
+	log.Println("File migration completed")
 }
 
 // 获取用户帖子
@@ -497,50 +620,6 @@ func getLatestComments(c *gin.Context) {
 	c.JSON(200, comments)
 }
 
-// 图片URL迁移函数
-func migrateImageURLs() {
-	log.Println("Starting image URL migration...")
-	collection := client.Database("forum").Collection("posts")
-
-	cursor, err := collection.Find(context.TODO(), bson.M{
-		"imageURL": bson.M{"$exists": true, "$ne": ""},
-	})
-	if err != nil {
-		log.Printf("Error finding posts with images: %v", err)
-		return
-	}
-	defer cursor.Close(context.TODO())
-
-	var posts []Post
-	if err = cursor.All(context.TODO(), &posts); err != nil {
-		log.Printf("Error decoding posts: %v", err)
-		return
-	}
-
-	for _, post := range posts {
-		// 如果图片URL不是以 /uploads/ 开头
-		if !strings.HasPrefix(post.ImageURL, "/uploads/") {
-			newImageURL := "/uploads/" + strings.TrimPrefix(
-				strings.TrimPrefix(post.ImageURL, "/"),
-				"uploads/",
-			)
-
-			_, err := collection.UpdateOne(
-				context.TODO(),
-				bson.M{"_id": post.ID},
-				bson.M{"$set": bson.M{"imageURL": newImageURL}},
-			)
-			if err != nil {
-				log.Printf("Error updating image URL for post %s: %v", post.ID, err)
-				continue
-			}
-			log.Printf("Updated image URL for post %s: %s -> %s",
-				post.ID, post.ImageURL, newImageURL)
-		}
-	}
-	log.Println("Image URL migration completed")
-}
-
 func main() {
 	// 连接MongoDB
 	mongoURI := os.Getenv("MONGODB_URI")
@@ -563,8 +642,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	// 在设置路由之前执行迁移
-	migrateImageURLs()
+	// 初始化云存储
+	if err := initCloudStorage(); err != nil {
+		log.Printf("Warning: Failed to initialize cloud storage: %v", err)
+	}
+	// 执行迁移
+	migrateExistingFilesToCloud()
 
 	// 初始化Gin路由
 	r := gin.Default()
