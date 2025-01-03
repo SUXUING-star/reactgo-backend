@@ -9,12 +9,12 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
@@ -85,17 +85,18 @@ type EmailConfig struct {
 
 var emailConfig EmailConfig
 
-// Post 结构体添加 CommentsCount 字段
 type Post struct {
 	ID            primitive.ObjectID `bson:"_id,omitempty" json:"_id"`
 	Title         string             `bson:"title" json:"title"`
 	Content       string             `bson:"content" json:"content"`
 	Category      string             `bson:"category" json:"category"`
+	TopicID       primitive.ObjectID `bson:"topic_id,omitempty" json:"topic_id,omitempty"`
+	Topic         *Topic             `bson:"topic,omitempty" json:"topic,omitempty"` // 添加话题信息
 	AuthorID      primitive.ObjectID `bson:"author_id" json:"author_id"`
 	Author        string             `bson:"author" json:"author"`
 	CreatedAt     time.Time          `bson:"created_at" json:"created_at"`
 	CommentsCount int                `bson:"comments_count" json:"comments_count"`
-	ImageURL      string             `bson:"image_url" json:"imageURL"` // 修改这里
+	ImageURL      string             `bson:"image_url" json:"imageURL"`
 }
 
 // 修改 Comment 结构体，保留其他字段不变
@@ -109,6 +110,61 @@ type Comment struct {
 	ParentID  primitive.ObjectID   `bson:"parent_id,omitempty" json:"parent_id,omitempty"`
 	Likes     []primitive.ObjectID `bson:"likes,omitempty" json:"likes,omitempty"`
 	Replies   []Comment            `bson:"replies,omitempty" json:"replies"`
+}
+
+// 数据模型
+type Topic struct {
+	ID          primitive.ObjectID   `bson:"_id,omitempty" json:"_id"`
+	Title       string               `bson:"title" json:"title"`
+	Description string               `bson:"description" json:"description"`
+	Posts       []primitive.ObjectID `bson:"posts" json:"posts"`
+	CreatedBy   primitive.ObjectID   `bson:"created_by" json:"created_by"`
+	CreatedAt   time.Time            `bson:"created_at" json:"created_at"`
+}
+
+type Notification struct {
+	ID        primitive.ObjectID `bson:"_id,omitempty" json:"_id"`
+	UserID    primitive.ObjectID `bson:"user_id" json:"user_id"`
+	Type      string             `bson:"type" json:"type"` // comment, like, reply, etc.
+	Content   string             `bson:"content" json:"content"`
+	PostID    primitive.ObjectID `bson:"post_id" json:"post_id"`
+	IsRead    bool               `bson:"is_read" json:"is_read"`
+	CreatedAt time.Time          `bson:"created_at" json:"created_at"`
+}
+
+// 搜索相关数据结构
+type SearchResult struct {
+	Posts  []SearchPost `json:"posts"`
+	Topics []Topic      `json:"topics"`
+	Users  []UserInfo   `json:"users"`
+}
+
+// 消息相关数据结构
+type Message struct {
+	ID        primitive.ObjectID `bson:"_id,omitempty" json:"_id"`
+	FromID    primitive.ObjectID `bson:"from_id" json:"from_id"`
+	ToID      primitive.ObjectID `bson:"to_id" json:"to_id"`
+	Content   string             `bson:"content" json:"content"`
+	IsRead    bool               `bson:"is_read" json:"is_read"`
+	CreatedAt time.Time          `bson:"created_at" json:"created_at"`
+}
+
+type SearchPost struct {
+	ID           primitive.ObjectID `bson:"_id" json:"_id"`
+	Title        string             `bson:"title" json:"title"`
+	Content      string             `bson:"content" json:"content"`
+	Author       string             `bson:"author" json:"author"`
+	CreatedAt    time.Time          `bson:"created_at" json:"created_at"`
+	Tags         []string           `bson:"tags" json:"tags"`
+	LikeCount    int                `bson:"like_count" json:"like_count"`
+	CommentCount int                `bson:"comment_count" json:"comment_count"`
+}
+
+type UserInfo struct {
+	ID       primitive.ObjectID `bson:"_id" json:"_id"`
+	Username string             `bson:"username" json:"username"`
+	Avatar   string             `bson:"avatar" json:"avatar"`
+	Bio      string             `bson:"bio" json:"bio"`
 }
 
 // main.go
@@ -170,28 +226,6 @@ func initCloudStorage() error {
 
 	log.Println("Cloud storage initialized successfully")
 	return nil
-}
-
-// 上传文件到云存储
-func uploadToCloudStorage(file multipart.File, filename string) (string, error) {
-	if cloudStorage == nil || cloudStorage.bucket == nil {
-		return "", fmt.Errorf("cloud storage not initialized")
-	}
-
-	// 生成唯一的文件名
-	objectKey := "uploads/" + time.Now().Format("20060102150405") + "_" + filename
-
-	// 上传文件
-	err := cloudStorage.bucket.PutObject(objectKey, file)
-	if err != nil {
-		return "", err
-	}
-
-	// 返回文件的访问URL
-	return fmt.Sprintf("https://%s.%s/%s",
-		cloudStorage.BucketName,
-		cloudStorage.Endpoint,
-		objectKey), nil
 }
 
 // 修改文件上传处理函数
@@ -420,21 +454,6 @@ func getUserComments(c *gin.Context) {
 
 	log.Printf("Found %d comments", len(comments))
 	c.JSON(200, comments)
-}
-
-// 验证令牌
-func verifyToken(c *gin.Context) {
-	userID, exists := c.Get("user_id")
-	if !exists {
-		c.JSON(401, gin.H{"error": "Unauthorized"})
-		return
-	}
-
-	username, _ := c.Get("username")
-	c.JSON(200, gin.H{
-		"user_id":  userID,
-		"username": username,
-	})
 }
 
 // 更新帖子
@@ -813,6 +832,37 @@ func main() {
 
 		api.GET("/community-stats", getCommunityStats)
 
+		// 发现页面相关
+		api.GET("/discover", getPopularPosts)
+		api.GET("/discover/topics/:topic", getPostsByTopic)
+
+		// 话题相关
+		api.GET("/topics", getTopics)
+		api.POST("/topics", authMiddleware(), createTopic)
+		api.GET("/topics/:id", getTopic)
+		api.GET("/topics/:id/posts", getTopicPosts)
+
+		// 排行榜相关
+		api.GET("/ranking/users", getUserRanking)
+		api.GET("/ranking/posts", getPostRanking)
+
+		// 通知相关
+		api.GET("/notifications", authMiddleware(), getNotifications)
+		api.PUT("/notifications/read", authMiddleware(), markNotificationsAsRead)
+
+		// 用户设置相关
+		api.PUT("/users/profile", authMiddleware(), updateUserProfile)
+		api.PUT("/users/password", authMiddleware(), updatePassword)
+
+		// 搜索相关
+		api.GET("/search", handleSearch)
+
+		// 消息相关
+		api.GET("/messages", authMiddleware(), getMessages)
+		api.POST("/messages", authMiddleware(), sendMessage)
+		api.PUT("/messages/:id/read", authMiddleware(), markMessageRead)
+		api.GET("/messages/unread-count", authMiddleware(), getUnreadCount)
+
 		// 添加一个检查路由来查看迁移结果
 		api.GET("/check-migration", func(c *gin.Context) {
 			collection := client.Database("forum").Collection("posts")
@@ -857,6 +907,619 @@ func main() {
 	}()
 }
 
+// 搜索处理函数
+func handleSearch(c *gin.Context) {
+	query := c.Query("q")
+	searchType := c.Query("type") // 可选参数：all, posts, topics, users
+	if query == "" {
+		c.JSON(400, gin.H{"error": "Search query is required"})
+		return
+	}
+
+	// 创建上下文和通道
+	ctx := context.TODO()
+	resultChan := make(chan SearchResult)
+	errorChan := make(chan error)
+
+	// 创建模糊搜索的正则表达式
+	searchRegex := primitive.Regex{Pattern: query, Options: "i"}
+
+	go func() {
+		var result SearchResult
+		var wg sync.WaitGroup
+
+		// 搜索帖子
+		if searchType == "all" || searchType == "posts" {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				posts := []SearchPost{}
+
+				// 聚合管道，包含评论数统计
+				pipeline := mongo.Pipeline{
+					{{Key: "$match", Value: bson.M{
+						"$or": []bson.M{
+							{"title": bson.M{"$regex": searchRegex}},
+							{"content": bson.M{"$regex": searchRegex}},
+							{"tags": bson.M{"$in": []string{query}}},
+						},
+					}}},
+					{{Key: "$lookup", Value: bson.M{
+						"from":         "comments",
+						"localField":   "_id",
+						"foreignField": "post_id",
+						"as":           "comments",
+					}}},
+					{{Key: "$addFields", Value: bson.M{
+						"comment_count": bson.M{"$size": "$comments"},
+					}}},
+					{{Key: "$sort", Value: bson.M{
+						"created_at": -1,
+					}}},
+					{{Key: "$limit", Value: 10}},
+				}
+
+				cursor, err := client.Database("forum").Collection("posts").Aggregate(ctx, pipeline)
+				if err == nil {
+					cursor.All(ctx, &posts)
+				}
+				result.Posts = posts
+			}()
+		}
+
+		// 搜索话题
+		if searchType == "all" || searchType == "topics" {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				topics := []Topic{}
+
+				pipeline := mongo.Pipeline{
+					{{Key: "$match", Value: bson.M{
+						"$or": []bson.M{
+							{"title": bson.M{"$regex": searchRegex}},
+							{"description": bson.M{"$regex": searchRegex}},
+						},
+					}}},
+					{{Key: "$lookup", Value: bson.M{
+						"from":         "posts",
+						"localField":   "_id",
+						"foreignField": "topic_id",
+						"as":           "posts",
+					}}},
+					{{Key: "$addFields", Value: bson.M{
+						"post_count": bson.M{"$size": "$posts"},
+					}}},
+					{{Key: "$sort", Value: bson.M{
+						"post_count": -1,
+					}}},
+					{{Key: "$limit", Value: 5}},
+				}
+
+				cursor, err := client.Database("forum").Collection("topics").Aggregate(ctx, pipeline)
+				if err == nil {
+					cursor.All(ctx, &topics)
+				}
+				result.Topics = topics
+			}()
+		}
+
+		// 搜索用户
+		if searchType == "all" || searchType == "users" {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				users := []UserInfo{}
+
+				pipeline := mongo.Pipeline{
+					{{Key: "$match", Value: bson.M{
+						"$or": []bson.M{
+							{"username": bson.M{"$regex": searchRegex}},
+							{"bio": bson.M{"$regex": searchRegex}},
+						},
+					}}},
+					{{Key: "$project", Value: bson.M{
+						"username": 1,
+						"avatar":   1,
+						"bio":      1,
+					}}},
+					{{Key: "$limit", Value: 5}},
+				}
+
+				cursor, err := client.Database("forum").Collection("users").Aggregate(ctx, pipeline)
+				if err == nil {
+					cursor.All(ctx, &users)
+				}
+				result.Users = users
+			}()
+		}
+
+		wg.Wait()
+		resultChan <- result
+	}()
+
+	// 等待结果或超时
+	select {
+	case result := <-resultChan:
+		c.JSON(200, result)
+	case err := <-errorChan:
+		c.JSON(500, gin.H{"error": err.Error()})
+	case <-time.After(5 * time.Second):
+		c.JSON(504, gin.H{"error": "Search timeout"})
+	}
+}
+
+// 标记消息为已读
+func markMessageRead(c *gin.Context) {
+	userID, _ := c.Get("user_id")
+	messageID, err := primitive.ObjectIDFromHex(c.Param("id"))
+	if err != nil {
+		c.JSON(400, gin.H{"error": "Invalid message ID"})
+		return
+	}
+
+	collection := client.Database("forum").Collection("messages")
+
+	// 确保只能标记发给自己的消息为已读
+	result, err := collection.UpdateOne(
+		context.TODO(),
+		bson.M{
+			"_id":     messageID,
+			"to_id":   userID.(primitive.ObjectID),
+			"is_read": false,
+		},
+		bson.M{"$set": bson.M{"is_read": true}},
+	)
+
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to mark message as read"})
+		return
+	}
+
+	if result.ModifiedCount == 0 {
+		c.JSON(404, gin.H{"error": "Message not found or already read"})
+		return
+	}
+
+	c.JSON(200, gin.H{"message": "Message marked as read"})
+}
+
+// 获取未读消息数量
+func getUnreadCount(c *gin.Context) {
+	userID, _ := c.Get("user_id")
+	collection := client.Database("forum").Collection("messages")
+
+	// 统计发送给当前用户的未读消息数量
+	count, err := collection.CountDocuments(
+		context.TODO(),
+		bson.M{
+			"to_id":   userID.(primitive.ObjectID),
+			"is_read": false,
+		},
+	)
+
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to get unread count"})
+		return
+	}
+
+	c.JSON(200, gin.H{"count": count})
+}
+
+// 获取消息列表
+func getMessages(c *gin.Context) {
+	userID, _ := c.Get("user_id")
+	collection := client.Database("forum").Collection("messages")
+
+	cursor, err := collection.Find(context.TODO(), bson.M{
+		"$or": []bson.M{
+			{"from_id": userID.(primitive.ObjectID)},
+			{"to_id": userID.(primitive.ObjectID)},
+		},
+	}, options.Find().SetSort(bson.M{"created_at": -1}))
+
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to fetch messages"})
+		return
+	}
+
+	var messages []Message
+	if err = cursor.All(context.TODO(), &messages); err != nil {
+		c.JSON(500, gin.H{"error": "Failed to decode messages"})
+		return
+	}
+
+	c.JSON(200, messages)
+}
+
+// 发送消息
+func sendMessage(c *gin.Context) {
+	fromID, _ := c.Get("user_id")
+	var message struct {
+		ToID    string `json:"to_id"`
+		Content string `json:"content"`
+	}
+
+	if err := c.ShouldBindJSON(&message); err != nil {
+		c.JSON(400, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	toID, err := primitive.ObjectIDFromHex(message.ToID)
+	if err != nil {
+		c.JSON(400, gin.H{"error": "Invalid recipient ID"})
+		return
+	}
+
+	newMessage := Message{
+		ID:        primitive.NewObjectID(),
+		FromID:    fromID.(primitive.ObjectID),
+		ToID:      toID,
+		Content:   message.Content,
+		IsRead:    false,
+		CreatedAt: time.Now(),
+	}
+
+	collection := client.Database("forum").Collection("messages")
+	_, err = collection.InsertOne(context.TODO(), newMessage)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to send message"})
+		return
+	}
+
+	c.JSON(201, newMessage)
+}
+
+func getPostsByTopic(c *gin.Context) {
+	topicID, err := primitive.ObjectIDFromHex(c.Param("topic"))
+	if err != nil {
+		c.JSON(400, gin.H{"error": "Invalid topic ID"})
+		return
+	}
+
+	collection := client.Database("forum").Collection("posts")
+	cursor, err := collection.Find(context.TODO(), bson.M{"topic_id": topicID})
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to fetch posts"})
+		return
+	}
+	defer cursor.Close(context.TODO())
+
+	var posts []Post
+	if err = cursor.All(context.TODO(), &posts); err != nil {
+		c.JSON(500, gin.H{"error": "Failed to decode posts"})
+		return
+	}
+
+	c.JSON(200, posts)
+}
+
+func createTopic(c *gin.Context) {
+	userID, _ := c.Get("user_id")
+
+	var topic Topic
+	if err := c.ShouldBindJSON(&topic); err != nil {
+		c.JSON(400, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	topic.ID = primitive.NewObjectID()
+	topic.CreatedBy = userID.(primitive.ObjectID)
+	topic.CreatedAt = time.Now()
+	topic.Posts = []primitive.ObjectID{}
+
+	collection := client.Database("forum").Collection("topics")
+	_, err := collection.InsertOne(context.TODO(), topic)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to create topic"})
+		return
+	}
+
+	c.JSON(201, topic)
+}
+
+func getTopic(c *gin.Context) {
+	topicID, err := primitive.ObjectIDFromHex(c.Param("id"))
+	if err != nil {
+		c.JSON(400, gin.H{"error": "Invalid topic ID"})
+		return
+	}
+
+	collection := client.Database("forum").Collection("topics")
+	var topic Topic
+	err = collection.FindOne(context.TODO(), bson.M{"_id": topicID}).Decode(&topic)
+	if err != nil {
+		c.JSON(404, gin.H{"error": "Topic not found"})
+		return
+	}
+
+	c.JSON(200, topic)
+}
+
+func getTopicPosts(c *gin.Context) {
+	topicID, err := primitive.ObjectIDFromHex(c.Param("id"))
+	if err != nil {
+		c.JSON(400, gin.H{"error": "Invalid topic ID"})
+		return
+	}
+
+	collection := client.Database("forum").Collection("posts")
+	cursor, err := collection.Find(context.TODO(), bson.M{"topic_id": topicID})
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to fetch posts"})
+		return
+	}
+	defer cursor.Close(context.TODO())
+
+	var posts []Post
+	if err = cursor.All(context.TODO(), &posts); err != nil {
+		c.JSON(500, gin.H{"error": "Failed to decode posts"})
+		return
+	}
+
+	c.JSON(200, posts)
+}
+
+func getUserRanking(c *gin.Context) {
+	collection := client.Database("forum").Collection("posts")
+
+	pipeline := mongo.Pipeline{
+		{{Key: "$group", Value: bson.M{
+			"_id":        "$author_id",
+			"username":   bson.M{"$first": "$author"},
+			"post_count": bson.M{"$sum": 1},
+		}}},
+		{{Key: "$sort", Value: bson.M{"post_count": -1}}},
+		{{Key: "$limit", Value: 10}},
+	}
+
+	cursor, err := collection.Aggregate(context.TODO(), pipeline)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to fetch user ranking"})
+		return
+	}
+
+	var rankings []struct {
+		ID        primitive.ObjectID `bson:"_id" json:"_id"`
+		Username  string             `bson:"username" json:"username"`
+		PostCount int                `bson:"post_count" json:"post_count"`
+	}
+
+	if err = cursor.All(context.TODO(), &rankings); err != nil {
+		c.JSON(500, gin.H{"error": "Failed to decode rankings"})
+		return
+	}
+
+	c.JSON(200, rankings)
+}
+
+func getPostRanking(c *gin.Context) {
+	collection := client.Database("forum").Collection("posts")
+
+	pipeline := mongo.Pipeline{
+		{{Key: "$lookup", Value: bson.M{
+			"from":         "comments",
+			"localField":   "_id",
+			"foreignField": "post_id",
+			"as":           "comments",
+		}}},
+		{{Key: "$addFields", Value: bson.M{
+			"comment_count": bson.M{"$size": "$comments"},
+		}}},
+		{{Key: "$sort", Value: bson.M{
+			"comment_count": -1,
+			"created_at":    -1,
+		}}},
+		{{Key: "$limit", Value: 10}},
+	}
+
+	cursor, err := collection.Aggregate(context.TODO(), pipeline)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to fetch post ranking"})
+		return
+	}
+
+	var posts []Post
+	if err = cursor.All(context.TODO(), &posts); err != nil {
+		c.JSON(500, gin.H{"error": "Failed to decode posts"})
+		return
+	}
+
+	c.JSON(200, posts)
+}
+
+func markNotificationsAsRead(c *gin.Context) {
+	userID, _ := c.Get("user_id")
+
+	collection := client.Database("forum").Collection("notifications")
+	_, err := collection.UpdateMany(
+		context.TODO(),
+		bson.M{
+			"user_id": userID.(primitive.ObjectID),
+			"is_read": false,
+		},
+		bson.M{"$set": bson.M{"is_read": true}},
+	)
+
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to mark notifications as read"})
+		return
+	}
+
+	c.JSON(200, gin.H{"message": "Notifications marked as read"})
+}
+
+func updatePassword(c *gin.Context) {
+	userID, _ := c.Get("user_id")
+
+	var passwords struct {
+		OldPassword string `json:"old_password"`
+		NewPassword string `json:"new_password"`
+	}
+
+	if err := c.ShouldBindJSON(&passwords); err != nil {
+		c.JSON(400, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	// 获取用户当前密码
+	collection := client.Database("forum").Collection("users")
+	var user User
+	err := collection.FindOne(context.TODO(), bson.M{"_id": userID.(primitive.ObjectID)}).Decode(&user)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to fetch user"})
+		return
+	}
+
+	// 验证旧密码
+	err = bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(passwords.OldPassword))
+	if err != nil {
+		c.JSON(400, gin.H{"error": "Invalid old password"})
+		return
+	}
+
+	// 加密新密码
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(passwords.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to hash new password"})
+		return
+	}
+
+	// 更新密码
+	_, err = collection.UpdateOne(
+		context.TODO(),
+		bson.M{"_id": userID.(primitive.ObjectID)},
+		bson.M{"$set": bson.M{"password": string(hashedPassword)}},
+	)
+
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to update password"})
+		return
+	}
+
+	c.JSON(200, gin.H{"message": "Password updated successfully"})
+}
+
+// 处理函数实现
+func getPopularPosts(c *gin.Context) {
+	collection := client.Database("forum").Collection("posts")
+
+	// 获取最近7天的帖子，按评论数和点赞数排序
+	sevenDaysAgo := time.Now().AddDate(0, 0, -7)
+
+	pipeline := mongo.Pipeline{
+		{{Key: "$match", Value: bson.M{
+			"created_at": bson.M{"$gte": sevenDaysAgo},
+		}}},
+		{{Key: "$lookup", Value: bson.M{
+			"from":         "comments",
+			"localField":   "_id",
+			"foreignField": "post_id",
+			"as":           "comments",
+		}}},
+		{{Key: "$addFields", Value: bson.M{
+			"comment_count": bson.M{"$size": "$comments"},
+		}}},
+		{{Key: "$sort", Value: bson.M{
+			"comment_count": -1,
+			"created_at":    -1,
+		}}},
+		{{Key: "$limit", Value: 20}},
+	}
+
+	cursor, err := collection.Aggregate(context.TODO(), pipeline)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to fetch posts"})
+		return
+	}
+
+	var posts []Post
+	if err = cursor.All(context.TODO(), &posts); err != nil {
+		c.JSON(500, gin.H{"error": "Failed to decode posts"})
+		return
+	}
+
+	c.JSON(200, posts)
+}
+
+func getTopics(c *gin.Context) {
+	collection := client.Database("forum").Collection("topics")
+
+	cursor, err := collection.Find(context.TODO(), bson.M{})
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to fetch topics"})
+		return
+	}
+
+	var topics []Topic
+	if err = cursor.All(context.TODO(), &topics); err != nil {
+		c.JSON(500, gin.H{"error": "Failed to decode topics"})
+		return
+	}
+
+	c.JSON(200, topics)
+}
+
+func getNotifications(c *gin.Context) {
+	userID, _ := c.Get("user_id")
+	collection := client.Database("forum").Collection("notifications")
+
+	options := options.Find().
+		SetSort(bson.M{"created_at": -1}).
+		SetLimit(50)
+
+	cursor, err := collection.Find(context.TODO(),
+		bson.M{"user_id": userID.(primitive.ObjectID)},
+		options,
+	)
+
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to fetch notifications"})
+		return
+	}
+
+	var notifications []Notification
+	if err = cursor.All(context.TODO(), &notifications); err != nil {
+		c.JSON(500, gin.H{"error": "Failed to decode notifications"})
+		return
+	}
+
+	c.JSON(200, notifications)
+}
+
+func updateUserProfile(c *gin.Context) {
+	userID, _ := c.Get("user_id")
+
+	var updateData struct {
+		Nickname string `json:"nickname"`
+		Email    string `json:"email"`
+		Bio      string `json:"bio"`
+	}
+
+	if err := c.ShouldBindJSON(&updateData); err != nil {
+		c.JSON(400, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	collection := client.Database("forum").Collection("users")
+	_, err := collection.UpdateOne(
+		context.TODO(),
+		bson.M{"_id": userID.(primitive.ObjectID)},
+		bson.M{"$set": bson.M{
+			"username": updateData.Nickname,
+			"email":    updateData.Email,
+			"bio":      updateData.Bio,
+		}},
+	)
+
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to update profile"})
+		return
+	}
+
+	c.JSON(200, gin.H{"message": "Profile updated successfully"})
+}
+
 // 删除未验证的过期账户
 func cleanupUnverifiedAccounts() {
 	collection := client.Database("forum").Collection("users")
@@ -877,6 +1540,22 @@ func cleanupUnverifiedAccounts() {
 
 	log.Printf("Cleaned up %v unverified accounts", result.DeletedCount)
 }
+
+// 验证令牌
+func verifyToken(c *gin.Context) {
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(401, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	username, _ := c.Get("username")
+	c.JSON(200, gin.H{
+		"user_id":  userID,
+		"username": username,
+	})
+}
+
 func sendVerificationEmail(to, token string) error {
 	m := gomail.NewMessage()
 
@@ -1204,7 +1883,21 @@ func authMiddleware() gin.HandlerFunc {
 func getPosts(c *gin.Context) {
 	collection := client.Database("forum").Collection("posts")
 
-	cursor, err := collection.Find(context.TODO(), bson.M{}, options.Find().SetSort(bson.M{"created_at": -1}))
+	pipeline := mongo.Pipeline{
+		{{Key: "$lookup", Value: bson.M{
+			"from":         "topics",
+			"localField":   "topic_id",
+			"foreignField": "_id",
+			"as":           "topic",
+		}}},
+		{{Key: "$unwind", Value: bson.M{
+			"path":                       "$topic",
+			"preserveNullAndEmptyArrays": true,
+		}}},
+		{{Key: "$sort", Value: bson.M{"created_at": -1}}},
+	}
+
+	cursor, err := collection.Aggregate(context.TODO(), pipeline)
 	if err != nil {
 		log.Printf("Error fetching posts: %v", err)
 		c.JSON(500, gin.H{"error": "Failed to fetch posts"})
@@ -1283,68 +1976,42 @@ func getPost(c *gin.Context) {
 }
 
 func createPost(c *gin.Context) {
-	userID, exists := c.Get("user_id")
-	if !exists {
-		log.Printf("User ID not found in context")
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
-		return
-	}
+	userID, _ := c.Get("user_id")
+	username, _ := c.Get("username")
 
-	username, exists := c.Get("username")
-	if !exists {
-		log.Printf("Username not found in context")
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Username not found"})
-		return
-	}
-
-	// 创建一个新的 Post 结构体来接收数据
 	var post Post
 	if err := c.ShouldBindJSON(&post); err != nil {
-		log.Printf("Error binding JSON: %v", err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(400, gin.H{"error": "Invalid request"})
 		return
 	}
 
-	// 验证必需字段
-	if post.Title == "" || post.Content == "" || post.Category == "" {
-		log.Printf("Missing required fields")
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Title, content and category are required"})
-		return
-	}
-
-	// 设置帖子的其他字段
-	post.ID = primitive.NewObjectID() // 生成新的 ID
+	post.ID = primitive.NewObjectID()
 	post.AuthorID = userID.(primitive.ObjectID)
 	post.Author = username.(string)
-	post.CreatedAt = time.Now().UTC()
-	post.CommentsCount = 0
+	post.CreatedAt = time.Now()
 
-	// 打印帖子数据以便调试
-	log.Printf("Creating post: %+v", post)
+	// 如果指定了话题，更新话题的帖子列表
+	if !post.TopicID.IsZero() {
+		topicsCollection := client.Database("forum").Collection("topics")
+		_, err := topicsCollection.UpdateOne(
+			context.TODO(),
+			bson.M{"_id": post.TopicID},
+			bson.M{"$push": bson.M{"posts": post.ID}},
+		)
+		if err != nil {
+			c.JSON(500, gin.H{"error": "Failed to update topic"})
+			return
+		}
+	}
 
 	collection := client.Database("forum").Collection("posts")
-	result, err := collection.InsertOne(context.TODO(), post)
+	_, err := collection.InsertOne(context.TODO(), post)
 	if err != nil {
-		log.Printf("Error inserting post: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create post"})
+		c.JSON(500, gin.H{"error": "Failed to create post"})
 		return
 	}
 
-	// 获取已创建的帖子
-	var createdPost Post
-	err = collection.FindOne(context.TODO(), bson.M{"_id": result.InsertedID}).Decode(&createdPost)
-	if err != nil {
-		log.Printf("Error fetching created post: %v", err)
-		c.JSON(http.StatusOK, gin.H{
-			"id":      result.InsertedID,
-			"message": "Post created successfully",
-		})
-		return
-	}
-
-	// 返回已创建的帖子
-	log.Printf("Successfully created post: %+v", createdPost)
-	c.JSON(http.StatusCreated, createdPost)
+	c.JSON(201, post)
 }
 
 func createComment(c *gin.Context) {

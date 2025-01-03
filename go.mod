@@ -1,5 +1,5 @@
 // go.mod
-module login-system
+module github.com/SUXUING-star/reactgo-backend
 
 go 1.21.0
 
