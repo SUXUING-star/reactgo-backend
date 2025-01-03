@@ -577,6 +577,66 @@ func deletePost(c *gin.Context) {
 	c.JSON(200, gin.H{"message": "Post and all related comments deleted successfully"})
 }
 
+// 修改 deleteTopic 函数
+func deleteTopic(c *gin.Context) {
+	topicID, err := primitive.ObjectIDFromHex(c.Param("id"))
+	if err != nil {
+		log.Printf("Invalid topic ID: %v", err)
+		c.JSON(400, gin.H{"error": "Invalid topic ID"})
+		return
+	}
+	userID, exists := c.Get("user_id")
+	if !exists {
+		log.Printf("User ID not found in context")
+		c.JSON(401, gin.H{"error": "User ID not found"})
+		return
+	}
+
+	username, exists := c.Get("username")
+	if !exists {
+		log.Printf("Username not found in context")
+		c.JSON(401, gin.H{"error": "Username not found"})
+		return
+	}
+	collection := client.Database("forum").Collection("topics")
+	postsCollection := client.Database("forum").Collection("posts")
+
+	// 检查用户权限, 如果不是管理员则验证是否是创建者
+	if username.(string) != "admin" {
+		var topic Topic
+		err = collection.FindOne(context.TODO(), bson.M{"_id": topicID}).Decode(&topic)
+		if err != nil {
+			c.JSON(404, gin.H{"error": "Topic not found"})
+			return
+		}
+
+		if topic.CreatedBy != userID.(primitive.ObjectID) {
+			c.JSON(403, gin.H{"error": "Not authorized to delete this topic"})
+			return
+		}
+	}
+
+	// 删除 topic 中的所有 posts
+	_, err = postsCollection.UpdateMany(context.TODO(),
+		bson.M{"topic_id": topicID},
+		bson.M{"$set": bson.M{"topic_id": nil}},
+	)
+	if err != nil {
+		log.Printf("Error updating posts topic: %v", err)
+		c.JSON(500, gin.H{"error": "Failed to update posts topic"})
+		return
+	}
+	// 删除话题本身
+	_, err = collection.DeleteOne(context.TODO(), bson.M{"_id": topicID})
+	if err != nil {
+		log.Printf("Error deleting topic: %v", err)
+		c.JSON(500, gin.H{"error": "Failed to delete topic"})
+		return
+	}
+
+	c.JSON(200, gin.H{"message": "Topic deleted successfully"})
+}
+
 // 修改 deleteComment 函数，不使用事务
 func deleteComment(c *gin.Context) {
 	commentID, err := primitive.ObjectIDFromHex(c.Param("id"))
@@ -831,6 +891,7 @@ func main() {
 		api.PUT("/posts/:id", authMiddleware(), updatePost)
 		api.DELETE("/posts/:id", authMiddleware(), deletePost)
 		api.DELETE("/comments/:id", authMiddleware(), deleteComment)
+		api.DELETE("/topics/:id", authMiddleware(), deleteTopic)
 
 		// 评论相关
 		api.GET("/posts/:id/comments", getComments)
