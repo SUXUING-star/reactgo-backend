@@ -478,16 +478,17 @@ func updatePost(c *gin.Context) {
 		return
 	}
 
+	// 修改数据结构，包括 topic_id
 	var updateData struct {
-		Title    string `json:"title"`
-		Content  string `json:"content"`
-		ImageURL string `json:"imageURL"`
+		Title    string  `json:"title"`
+		Content  string  `json:"content"`
+		ImageURL string  `json:"imageURL"`
+		TopicID  *string `json:"topic_id"` // topic_id 可能为空，使用 *string
 	}
 	if err := c.ShouldBindJSON(&updateData); err != nil {
 		c.JSON(400, gin.H{"error": "Invalid request"})
 		return
 	}
-
 	update := bson.M{
 		"$set": bson.M{
 			"title":     updateData.Title,
@@ -495,6 +496,16 @@ func updatePost(c *gin.Context) {
 			"image_url": updateData.ImageURL,
 		},
 	}
+	// 添加 topic_id 更新
+	if updateData.TopicID != nil {
+		topicID, err := primitive.ObjectIDFromHex(*updateData.TopicID)
+		if err == nil {
+			update["$set"].(bson.M)["topic_id"] = topicID
+		} else {
+			update["$set"].(bson.M)["topic_id"] = nil
+		}
+	}
+
 	log.Printf("Updating post %s with image URL: %s", postID, updateData.ImageURL)
 
 	_, err = collection.UpdateOne(context.TODO(), bson.M{"_id": postID}, update)
