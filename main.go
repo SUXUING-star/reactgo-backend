@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -782,6 +784,19 @@ func getLatestComments(c *gin.Context) {
 	c.JSON(200, comments)
 }
 
+// 获取所有分类
+func getCategories(c *gin.Context) {
+	// 这里可以从数据库中获取分类，或者直接返回预定义的分类列表
+	categories := []string{
+		"讨论",
+		"问答",
+		"分享",
+		"建议",
+		"其他",
+	}
+	c.JSON(200, categories)
+}
+
 func main() {
 	// 连接MongoDB
 	mongoURI := os.Getenv("MONGODB_URI")
@@ -887,6 +902,7 @@ func main() {
 		// 帖子相关
 		api.GET("/posts", getPosts)
 		api.GET("/posts/:id", getPost)
+		api.GET("/categories", getCategories)
 		api.POST("/posts", authMiddleware(), createPost)
 		api.PUT("/posts/:id", authMiddleware(), updatePost)
 		api.DELETE("/posts/:id", authMiddleware(), deletePost)
@@ -1400,27 +1416,6 @@ func getPostRanking(c *gin.Context) {
 	c.JSON(200, posts)
 }
 
-func markNotificationsAsRead(c *gin.Context) {
-	userID, _ := c.Get("user_id")
-
-	collection := client.Database("forum").Collection("notifications")
-	_, err := collection.UpdateMany(
-		context.TODO(),
-		bson.M{
-			"user_id": userID.(primitive.ObjectID),
-			"is_read": false,
-		},
-		bson.M{"$set": bson.M{"is_read": true}},
-	)
-
-	if err != nil {
-		c.JSON(500, gin.H{"error": "Failed to mark notifications as read"})
-		return
-	}
-
-	c.JSON(200, gin.H{"message": "Notifications marked as read"})
-}
-
 func updatePassword(c *gin.Context) {
 	userID, _ := c.Get("user_id")
 
@@ -1532,8 +1527,35 @@ func getTopics(c *gin.Context) {
 	c.JSON(200, topics)
 }
 
+// 创建通知，并添加日志记录
+func createNotification(userID primitive.ObjectID, postID primitive.ObjectID, notificationType string, content string) error {
+	log.Printf("Creating notification for user %s, post %s, type %s", userID.Hex(), postID.Hex(), notificationType)
+
+	notification := Notification{
+		ID:        primitive.NewObjectID(),
+		UserID:    userID,
+		Type:      notificationType,
+		Content:   content,
+		PostID:    postID,
+		IsRead:    false,
+		CreatedAt: time.Now(),
+	}
+
+	collection := client.Database("forum").Collection("notifications")
+	result, err := collection.InsertOne(context.TODO(), notification)
+	if err != nil {
+		log.Printf("Error creating notification: %v", err)
+		return err
+	}
+	log.Printf("Successfully created notification with ID: %v", result.InsertedID)
+	return nil
+}
+
+// 获取通知列表时添加日志
 func getNotifications(c *gin.Context) {
 	userID, _ := c.Get("user_id")
+	log.Printf("Fetching notifications for user: %s", userID.(primitive.ObjectID).Hex())
+
 	collection := client.Database("forum").Collection("notifications")
 
 	options := options.Find().
@@ -1544,19 +1566,44 @@ func getNotifications(c *gin.Context) {
 		bson.M{"user_id": userID.(primitive.ObjectID)},
 		options,
 	)
-
 	if err != nil {
+		log.Printf("Error fetching notifications: %v", err)
 		c.JSON(500, gin.H{"error": "Failed to fetch notifications"})
 		return
 	}
+	defer cursor.Close(context.TODO())
 
 	var notifications []Notification
 	if err = cursor.All(context.TODO(), &notifications); err != nil {
+		log.Printf("Error decoding notifications: %v", err)
 		c.JSON(500, gin.H{"error": "Failed to decode notifications"})
 		return
 	}
 
+	log.Printf("Found %d notifications for user %s", len(notifications), userID.(primitive.ObjectID).Hex())
 	c.JSON(200, notifications)
+}
+
+// 标记通知为已读
+func markNotificationsAsRead(c *gin.Context) {
+	userID, _ := c.Get("user_id")
+	collection := client.Database("forum").Collection("notifications")
+
+	_, err := collection.UpdateMany(
+		context.TODO(),
+		bson.M{
+			"user_id": userID.(primitive.ObjectID),
+			"is_read": false,
+		},
+		bson.M{"$set": bson.M{"is_read": true}},
+	)
+
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to mark notifications as read"})
+		return
+	}
+
+	c.JSON(200, gin.H{"message": "All notifications marked as read"})
 }
 
 func updateUserProfile(c *gin.Context) {
@@ -1952,10 +1999,47 @@ func authMiddleware() gin.HandlerFunc {
 	}
 }
 
+// 修改获取帖子列表的函数，支持分页和筛选
 func getPosts(c *gin.Context) {
+	// 获取分页参数
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("pageSize", "10"))
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 10
+	}
+
+	// 构建查询条件
+	filter := bson.M{}
+
+	// 添加分类筛选
+	if category := c.Query("category"); category != "" {
+		filter["category"] = category
+	}
+
+	// 添加话题筛选
+	if topicID := c.Query("topic_id"); topicID != "" {
+		objectID, err := primitive.ObjectIDFromHex(topicID)
+		if err == nil {
+			filter["topic_id"] = objectID
+		}
+	}
+
 	collection := client.Database("forum").Collection("posts")
 
+	// 获取总数
+	total, err := collection.CountDocuments(context.TODO(), filter)
+	if err != nil {
+		log.Printf("Error counting posts: %v", err)
+		c.JSON(500, gin.H{"error": "Failed to count posts"})
+		return
+	}
+
+	// 构建聚合管道
 	pipeline := mongo.Pipeline{
+		{{Key: "$match", Value: filter}},
 		{{Key: "$lookup", Value: bson.M{
 			"from":         "topics",
 			"localField":   "topic_id",
@@ -1967,6 +2051,8 @@ func getPosts(c *gin.Context) {
 			"preserveNullAndEmptyArrays": true,
 		}}},
 		{{Key: "$sort", Value: bson.M{"created_at": -1}}},
+		{{Key: "$skip", Value: (page - 1) * pageSize}},
+		{{Key: "$limit", Value: pageSize}},
 	}
 
 	cursor, err := collection.Aggregate(context.TODO(), pipeline)
@@ -1984,7 +2070,16 @@ func getPosts(c *gin.Context) {
 		return
 	}
 
-	c.JSON(200, posts)
+	// 计算总页数
+	totalPages := int(math.Ceil(float64(total) / float64(pageSize)))
+
+	c.JSON(200, gin.H{
+		"posts":      posts,
+		"total":      total,
+		"page":       page,
+		"pageSize":   pageSize,
+		"totalPages": totalPages,
+	})
 }
 
 func getPost(c *gin.Context) {
@@ -2086,6 +2181,7 @@ func createPost(c *gin.Context) {
 	c.JSON(201, post)
 }
 
+// 修改 createComment 函数，更新通知逻辑
 func createComment(c *gin.Context) {
 	postID, err := primitive.ObjectIDFromHex(c.Param("id"))
 	if err != nil {
@@ -2101,22 +2197,56 @@ func createComment(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "Invalid request"})
 		return
 	}
+
+	// 先获取帖子信息
+	postsCollection := client.Database("forum").Collection("posts")
+	var post Post
+	err = postsCollection.FindOne(context.TODO(), bson.M{"_id": postID}).Decode(&post)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to fetch post"})
+		return
+	}
+
+	// 创建评论
 	comment.ID = primitive.NewObjectID()
 	comment.PostID = postID
 	comment.AuthorID = userID.(primitive.ObjectID)
 	comment.Author = username.(string)
 	comment.CreatedAt = time.Now()
+	comment.Likes = []primitive.ObjectID{}
+	comment.Replies = []Comment{}
 
 	collection := client.Database("forum").Collection("comments")
-	result, err := collection.InsertOne(context.TODO(), comment)
+	_, err = collection.InsertOne(context.TODO(), comment)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "Failed to create comment"})
 		return
 	}
 
-	c.JSON(201, gin.H{"id": result.InsertedID})
+	// 如果评论者不是帖子作者，创建通知
+	if post.AuthorID != userID.(primitive.ObjectID) {
+		log.Printf("Creating comment notification: commenter=%s, post_author=%s", userID.(primitive.ObjectID).Hex(), post.AuthorID.Hex())
+		notificationContent := fmt.Sprintf("%s 评论了你的帖子《%s》", username.(string), post.Title)
+		err = createNotification(post.AuthorID, postID, "comment", notificationContent)
+		if err != nil {
+			log.Printf("Error creating notification: %v", err)
+		}
+	}
+
+	// 更新帖子的评论数
+	_, err = postsCollection.UpdateOne(
+		context.TODO(),
+		bson.M{"_id": postID},
+		bson.M{"$inc": bson.M{"comments_count": 1}},
+	)
+	if err != nil {
+		log.Printf("Error updating post comment count: %v", err)
+	}
+
+	c.JSON(201, comment)
 }
 
+// 修改 handleReply 函数，更新通知逻辑
 func handleReply(c *gin.Context) {
 	parentID, err := primitive.ObjectIDFromHex(c.Param("id"))
 	if err != nil {
@@ -2145,6 +2275,7 @@ func handleReply(c *gin.Context) {
 		return
 	}
 
+	// 创建回复
 	reply := Comment{
 		ID:        primitive.NewObjectID(),
 		PostID:    parentComment.PostID,
@@ -2153,12 +2284,51 @@ func handleReply(c *gin.Context) {
 		Author:    username.(string),
 		CreatedAt: time.Now(),
 		ParentID:  parentID,
+		Likes:     []primitive.ObjectID{},
 	}
 
+	// 插入回复
 	_, err = collection.InsertOne(context.TODO(), reply)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "Failed to create reply"})
 		return
+	}
+
+	// 如果回复者不是原评论作者，创建通知
+	if parentComment.AuthorID != userID.(primitive.ObjectID) {
+		// 获取帖子信息
+		postsCollection := client.Database("forum").Collection("posts")
+		var post Post
+		err = postsCollection.FindOne(context.TODO(), bson.M{"_id": parentComment.PostID}).Decode(&post)
+		if err == nil {
+			log.Printf("Creating reply notification: replier=%s, comment_author=%s", userID.(primitive.ObjectID).Hex(), parentComment.AuthorID.Hex())
+			notificationContent := fmt.Sprintf("%s 回复了你在《%s》中的评论", username.(string), post.Title)
+			err = createNotification(parentComment.AuthorID, parentComment.PostID, "reply", notificationContent)
+			if err != nil {
+				log.Printf("Error creating notification: %v", err)
+			}
+		}
+	}
+
+	// 更新父评论以包含新回复
+	_, err = collection.UpdateOne(
+		context.TODO(),
+		bson.M{"_id": parentID},
+		bson.M{"$push": bson.M{"replies": reply}},
+	)
+	if err != nil {
+		log.Printf("Error updating parent comment with reply: %v", err)
+	}
+
+	// 更新帖子的评论计数
+	postsCollection := client.Database("forum").Collection("posts")
+	_, err = postsCollection.UpdateOne(
+		context.TODO(),
+		bson.M{"_id": parentComment.PostID},
+		bson.M{"$inc": bson.M{"comments_count": 1}},
+	)
+	if err != nil {
+		log.Printf("Error updating post comment count: %v", err)
 	}
 
 	c.JSON(201, reply)
