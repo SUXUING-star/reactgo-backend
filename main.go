@@ -130,6 +130,7 @@ type Notification struct {
 	Type      string             `bson:"type" json:"type"` // comment, like, reply, etc.
 	Content   string             `bson:"content" json:"content"`
 	PostID    primitive.ObjectID `bson:"post_id" json:"post_id"`
+	CommentID primitive.ObjectID `bson:"comment_id,omitempty" json:"comment_id,omitempty"`
 	IsRead    bool               `bson:"is_read" json:"is_read"`
 	CreatedAt time.Time          `bson:"created_at" json:"created_at"`
 }
@@ -1528,9 +1529,7 @@ func getTopics(c *gin.Context) {
 }
 
 // 创建通知，并添加日志记录
-func createNotification(userID primitive.ObjectID, postID primitive.ObjectID, notificationType string, content string) error {
-	log.Printf("Creating notification for user %s, post %s, type %s", userID.Hex(), postID.Hex(), notificationType)
-
+func createNotification(userID primitive.ObjectID, postID primitive.ObjectID, notificationType string, content string, commentID ...primitive.ObjectID) error {
 	notification := Notification{
 		ID:        primitive.NewObjectID(),
 		UserID:    userID,
@@ -1541,31 +1540,29 @@ func createNotification(userID primitive.ObjectID, postID primitive.ObjectID, no
 		CreatedAt: time.Now(),
 	}
 
-	collection := client.Database("forum").Collection("notifications")
-	result, err := collection.InsertOne(context.TODO(), notification)
-	if err != nil {
-		log.Printf("Error creating notification: %v", err)
-		return err
+	// 如果提供了评论ID，添加到通知中
+	if len(commentID) > 0 {
+		notification.CommentID = commentID[0]
 	}
-	log.Printf("Successfully created notification with ID: %v", result.InsertedID)
-	return nil
+
+	collection := client.Database("forum").Collection("notifications")
+	_, err := collection.InsertOne(context.TODO(), notification)
+	return err
 }
 
-// 获取通知列表时添加日志
+// 修改获取通知的函数，按时间倒序并限制数量
 func getNotifications(c *gin.Context) {
 	userID, _ := c.Get("user_id")
-	log.Printf("Fetching notifications for user: %s", userID.(primitive.ObjectID).Hex())
-
 	collection := client.Database("forum").Collection("notifications")
 
+	filter := bson.M{"user_id": userID.(primitive.ObjectID)}
+
+	// 按时间倒序获取最近50条通知
 	options := options.Find().
 		SetSort(bson.M{"created_at": -1}).
 		SetLimit(50)
 
-	cursor, err := collection.Find(context.TODO(),
-		bson.M{"user_id": userID.(primitive.ObjectID)},
-		options,
-	)
+	cursor, err := collection.Find(context.TODO(), filter, options)
 	if err != nil {
 		log.Printf("Error fetching notifications: %v", err)
 		c.JSON(500, gin.H{"error": "Failed to fetch notifications"})
@@ -2223,9 +2220,8 @@ func createComment(c *gin.Context) {
 		return
 	}
 
-	// 如果评论者不是帖子作者，创建通知
+	// 创建通知时使用统一的 'comment' 类型
 	if post.AuthorID != userID.(primitive.ObjectID) {
-		log.Printf("Creating comment notification: commenter=%s, post_author=%s", userID.(primitive.ObjectID).Hex(), post.AuthorID.Hex())
 		notificationContent := fmt.Sprintf("%s 评论了你的帖子《%s》", username.(string), post.Title)
 		err = createNotification(post.AuthorID, postID, "comment", notificationContent)
 		if err != nil {
@@ -2254,6 +2250,7 @@ func handleReply(c *gin.Context) {
 		return
 	}
 
+	// 获取评论集合
 	collection := client.Database("forum").Collection("comments")
 
 	// 获取父评论信息
@@ -2275,7 +2272,6 @@ func handleReply(c *gin.Context) {
 		return
 	}
 
-	// 创建回复
 	reply := Comment{
 		ID:        primitive.NewObjectID(),
 		PostID:    parentComment.PostID,
@@ -2296,14 +2292,14 @@ func handleReply(c *gin.Context) {
 
 	// 如果回复者不是原评论作者，创建通知
 	if parentComment.AuthorID != userID.(primitive.ObjectID) {
-		// 获取帖子信息
+		// 获取帖子集合
 		postsCollection := client.Database("forum").Collection("posts")
+		// 获取帖子信息
 		var post Post
 		err = postsCollection.FindOne(context.TODO(), bson.M{"_id": parentComment.PostID}).Decode(&post)
 		if err == nil {
-			log.Printf("Creating reply notification: replier=%s, comment_author=%s", userID.(primitive.ObjectID).Hex(), parentComment.AuthorID.Hex())
 			notificationContent := fmt.Sprintf("%s 回复了你在《%s》中的评论", username.(string), post.Title)
-			err = createNotification(parentComment.AuthorID, parentComment.PostID, "reply", notificationContent)
+			err = createNotification(parentComment.AuthorID, parentComment.PostID, "comment", notificationContent, parentID)
 			if err != nil {
 				log.Printf("Error creating notification: %v", err)
 			}
@@ -2343,8 +2339,41 @@ func handleLike(c *gin.Context) {
 	}
 
 	userID, _ := c.Get("user_id")
+	username, _ := c.Get("username")
 	collection := client.Database("forum").Collection("comments")
 
+	// 获取评论信息
+	var comment Comment
+	err = collection.FindOne(context.TODO(), bson.M{"_id": commentID}).Decode(&comment)
+	if err != nil {
+		c.JSON(404, gin.H{"error": "Comment not found"})
+		return
+	}
+
+	// 检查是否已经点赞
+	for _, likeID := range comment.Likes {
+		if likeID == userID.(primitive.ObjectID) {
+			c.JSON(400, gin.H{"error": "Already liked"})
+			return
+		}
+	}
+
+	// 如果点赞者不是评论作者，创建通知
+	if comment.AuthorID != userID.(primitive.ObjectID) {
+		postsCollection := client.Database("forum").Collection("posts")
+		var post Post
+		err = postsCollection.FindOne(context.TODO(), bson.M{"_id": comment.PostID}).Decode(&post)
+		if err == nil {
+			notificationContent := fmt.Sprintf("%s 赞了你在《%s》中的评论", username.(string), post.Title)
+			log.Printf("Creating like notification for user %s from %s", comment.AuthorID.Hex(), username.(string))
+			err = createNotification(comment.AuthorID, comment.PostID, "like", notificationContent, commentID)
+			if err != nil {
+				log.Printf("Error creating like notification: %v", err)
+			}
+		}
+	}
+
+	// 添加点赞
 	_, err = collection.UpdateOne(
 		context.TODO(),
 		bson.M{"_id": commentID},
@@ -2356,6 +2385,7 @@ func handleLike(c *gin.Context) {
 	)
 
 	if err != nil {
+		log.Printf("Error updating likes: %v", err)
 		c.JSON(500, gin.H{"error": "Failed to like comment"})
 		return
 	}
@@ -2363,7 +2393,7 @@ func handleLike(c *gin.Context) {
 	c.JSON(200, gin.H{"message": "Comment liked successfully"})
 }
 
-// 处理取消点赞
+// 修改 handleUnlike 函数
 func handleUnlike(c *gin.Context) {
 	commentID, err := primitive.ObjectIDFromHex(c.Param("id"))
 	if err != nil {
@@ -2374,7 +2404,8 @@ func handleUnlike(c *gin.Context) {
 	userID, _ := c.Get("user_id")
 	collection := client.Database("forum").Collection("comments")
 
-	_, err = collection.UpdateOne(
+	// 移除点赞
+	result, err := collection.UpdateOne(
 		context.TODO(),
 		bson.M{"_id": commentID},
 		bson.M{
@@ -2385,7 +2416,13 @@ func handleUnlike(c *gin.Context) {
 	)
 
 	if err != nil {
+		log.Printf("Error removing like: %v", err)
 		c.JSON(500, gin.H{"error": "Failed to unlike comment"})
+		return
+	}
+
+	if result.ModifiedCount == 0 {
+		c.JSON(400, gin.H{"error": "Comment not found or not liked"})
 		return
 	}
 
