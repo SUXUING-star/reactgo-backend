@@ -478,46 +478,32 @@ func getComments(c *gin.Context) {
 	}
 
 	collection := client.Database("forum").Collection("comments")
-	cursor, err := collection.Find(context.TODO(), bson.M{"post_id": postID})
+
+	// 只获取主评论
+	pipeline := mongo.Pipeline{
+		{{Key: "$match", Value: bson.M{
+			"post_id":   postID,
+			"parent_id": bson.M{"$exists": false}, // 只获取主评论
+		}}},
+		{{Key: "$sort", Value: bson.M{"created_at": -1}}}, // 按时间倒序排序
+		{{Key: "$limit", Value: 5}},                       // 限制返回数量
+	}
+
+	cursor, err := collection.Aggregate(context.TODO(), pipeline)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "Failed to fetch comments"})
 		return
 	}
 	defer cursor.Close(context.TODO())
 
-	var allComments []Comment
-	if err = cursor.All(context.TODO(), &allComments); err != nil {
+	var comments []Comment
+	if err = cursor.All(context.TODO(), &comments); err != nil {
 		c.JSON(500, gin.H{"error": "Failed to decode comments"})
 		return
 	}
 
-	commentMap := make(map[string]*Comment)
-	var rootComments []*Comment
-
-	for i := range allComments {
-		comment := &allComments[i]
-		commentMap[comment.ID.Hex()] = comment
-
-		if comment.ParentID.IsZero() {
-			comment.Replies = []Comment{}
-			rootComments = append(rootComments, comment)
-		}
-	}
-
-	for _, comment := range allComments {
-		if !comment.ParentID.IsZero() {
-			if parent, exists := commentMap[comment.ParentID.Hex()]; exists {
-				parent.Replies = append(parent.Replies, comment)
-			}
-		}
-	}
-
-	result := make([]Comment, len(rootComments))
-	for i, comment := range rootComments {
-		result[i] = *comment
-	}
-
-	c.JSON(200, result)
+	// 直接返回评论数组
+	c.JSON(200, comments)
 }
 
 func createComment(c *gin.Context) {
@@ -827,6 +813,7 @@ func handleSearch(c *gin.Context) {
 				defer wg.Done()
 				posts := []SearchPost{}
 
+				// 在 handler.go 中修改 handleSearch 函数中的 posts 查询 pipeline
 				pipeline := mongo.Pipeline{
 					{{Key: "$match", Value: bson.M{
 						"$or": []bson.M{
@@ -842,17 +829,27 @@ func handleSearch(c *gin.Context) {
 						"as":           "comments",
 					}}},
 					{{Key: "$addFields", Value: bson.M{
-						"comment_count": bson.M{"$size": "$comments"},
+						"comments_count": bson.M{"$size": "$comments"},
 					}}},
-					{{Key: "$sort", Value: bson.M{
-						"created_at": -1,
+					{{Key: "$project", Value: bson.M{
+						"title":          1,
+						"content":        1,
+						"author":         1,
+						"created_at":     1,
+						"image_url":      1,
+						"comments_count": 1,
+						"comments":       1,
 					}}},
+					{{Key: "$sort", Value: bson.M{"created_at": -1}}},
 					{{Key: "$limit", Value: 10}},
 				}
 
 				cursor, err := client.Database("forum").Collection("posts").Aggregate(ctx, pipeline)
 				if err == nil {
 					cursor.All(ctx, &posts)
+				}
+				for _, post := range posts {
+					log.Printf("Post: %+v\n", post)
 				}
 				result.Posts = posts
 			}()

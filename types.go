@@ -119,16 +119,16 @@ type Message struct {
 }
 
 type SearchPost struct {
-	ID           primitive.ObjectID `bson:"_id" json:"_id"`
-	Title        string             `bson:"title" json:"title"`
-	Content      string             `bson:"content" json:"content"`
-	Author       string             `bson:"author" json:"author"`
-	CreatedAt    time.Time          `bson:"created_at" json:"created_at"`
-	Tags         []string           `bson:"tags" json:"tags"`
-	LikeCount    int                `bson:"like_count" json:"like_count"`
-	CommentCount int                `bson:"comment_count" json:"comment_count"`
+	ID            primitive.ObjectID `bson:"_id,omitempty" json:"_id"`
+	Title         string             `bson:"title" json:"title"`
+	Content       string             `bson:"content" json:"content"`
+	Author        string             `bson:"author" json:"author"`
+	CreatedAt     time.Time          `bson:"created_at" json:"created_at"`
+	ImageURL      string             `bson:"image_url" json:"imageURL"`
+	CommentsCount int                `bson:"comments_count" json:"comments_count"`
+	LikeCount     int                `bson:"like_count" json:"like_count"`
+	Tags          []string           `bson:"tags" json:"tags"`
 }
-
 type UserInfo struct {
 	ID       primitive.ObjectID `bson:"_id" json:"_id"`
 	Username string             `bson:"username" json:"username"`

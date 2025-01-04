@@ -1,3 +1,5 @@
+// go run .
+// git add . && git commit -m "add go backend" && git push origin master
 package main
 
 import (
