@@ -32,16 +32,18 @@ type PostInfo struct {
 	Title string `json:"title" bson:"title"`
 }
 
+// 更新User结构体以支持QQ登录
 type User struct {
 	ID             primitive.ObjectID `bson:"_id,omitempty" json:"id"`
 	Username       string             `bson:"username" json:"username"`
-	Password       string             `bson:"password" json:"password"`
-	Email          string             `bson:"email" json:"email"`
+	Password       string             `bson:"password,omitempty" json:"-"`
+	Email          string             `bson:"email,omitempty" json:"email"`
+	QQOpenID       string             `bson:"qq_open_id,omitempty" json:"qq_open_id,omitempty"`
+	Avatar         string             `bson:"avatar,omitempty" json:"avatar"`
 	IsVerified     bool               `bson:"is_verified" json:"is_verified"`
-	VerifyToken    string             `bson:"verify_token" json:"verify_token"`
-	TokenExpiredAt time.Time          `bson:"token_expired_at" json:"token_expired_at"`
+	VerifyToken    string             `bson:"verify_token,omitempty" json:"-"`
+	TokenExpiredAt time.Time          `bson:"token_expired_at,omitempty" json:"-"`
 	CreatedAt      time.Time          `bson:"created_at" json:"created_at"`
-	Post           PostInfo           `json:"post"`
 }
 
 type Claims struct {
@@ -134,4 +136,18 @@ type UserInfo struct {
 	Username string             `bson:"username" json:"username"`
 	Avatar   string             `bson:"avatar" json:"avatar"`
 	Bio      string             `bson:"bio" json:"bio"`
+}
+
+// QQ登录配置结构体
+type QQConfig struct {
+	AppID       string
+	AppSecret   string
+	RedirectURI string
+}
+
+// QQ用户信息结构体
+type QQUserInfo struct {
+	OpenID    string `json:"openid"`
+	Nickname  string `json:"nickname"`
+	FigureURL string `json:"figureurl_qq_1"`
 }
