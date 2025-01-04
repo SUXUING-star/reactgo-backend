@@ -2331,6 +2331,7 @@ func handleReply(c *gin.Context) {
 }
 
 // 处理点赞
+
 func handleLike(c *gin.Context) {
 	commentID, err := primitive.ObjectIDFromHex(c.Param("id"))
 	if err != nil {
@@ -2365,15 +2366,14 @@ func handleLike(c *gin.Context) {
 		err = postsCollection.FindOne(context.TODO(), bson.M{"_id": comment.PostID}).Decode(&post)
 		if err == nil {
 			notificationContent := fmt.Sprintf("%s 赞了你在《%s》中的评论", username.(string), post.Title)
-			log.Printf("Creating like notification for user %s from %s", comment.AuthorID.Hex(), username.(string))
-			err = createNotification(comment.AuthorID, comment.PostID, "like", notificationContent, commentID)
+			err = createNotification(comment.AuthorID, post.ID, "like", notificationContent, commentID)
 			if err != nil {
-				log.Printf("Error creating like notification: %v", err)
+				log.Printf("Error creating notification: %v", err)
 			}
 		}
 	}
 
-	// 添加点赞
+	// 添加点赞，使用 $addToSet 确保唯一性
 	_, err = collection.UpdateOne(
 		context.TODO(),
 		bson.M{"_id": commentID},
