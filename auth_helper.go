@@ -41,14 +41,14 @@ func isValidEmail(email string) bool {
 // 发送验证邮件
 func sendVerificationEmail(to, token string) error {
 	m := gomail.NewMessage()
-	m.SetHeader("From", fmt.Sprintf("%s <%s>", "Tea Forum", emailConfig.From))
+	m.SetHeader("From", fmt.Sprintf("%s <%s>", "星云茶会", emailConfig.From))
 	m.SetHeader("To", to)
 	m.SetHeader("Subject", "验证您的邮箱")
 
 	verifyLink := fmt.Sprintf("https://www.suxingchahui.space/verify-email?token=%s", token)
 	htmlBody := fmt.Sprintf(`
         <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
-            <h2 style="color: #333;">欢迎注册茶会!</h2>
+            <h2 style="color: #333;">欢迎注册星云茶会!</h2>
             <p style="color: #666;">请点击下面的链接验证你的邮箱:</p>
             <a href="%s" style="display: inline-block; padding: 10px 20px; background-color: #4F46E5; color: white; text-decoration: none; border-radius: 5px;">验证邮箱</a>
             <p style="color: #666; margin-top: 20px;">此链接24小时内有效</p>
@@ -413,7 +413,7 @@ func getPostsByTopic(c *gin.Context) {
 // 发送重置密码邮件
 func sendResetPasswordEmail(to, token string) error {
 	m := gomail.NewMessage()
-	m.SetHeader("From", fmt.Sprintf("%s <%s>", "Tea Forum", emailConfig.From))
+	m.SetHeader("From", fmt.Sprintf("%s <%s>", "星云茶会", emailConfig.From))
 	m.SetHeader("To", to)
 	m.SetHeader("Subject", "重置密码")
 
