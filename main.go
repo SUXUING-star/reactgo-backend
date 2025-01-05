@@ -257,6 +257,11 @@ func setupRouter() *gin.Engine {
 		api.POST("/login", handleLogin)
 		api.GET("/verify-email", handleVerifyEmail)
 
+		// 密码重置相关路由
+		r.POST("/api/forgot-password", handleForgotPassword)
+		r.GET("/api/check-reset-token", handleCheckResetToken)
+		r.POST("/api/reset-password", handleResetPassword)
+
 		// 帖子相关
 		api.GET("/posts", getPosts)
 		api.GET("/posts/:id", getPost)

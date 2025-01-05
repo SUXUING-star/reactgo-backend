@@ -49,6 +49,8 @@ func getLatestComments(c *gin.Context) {
 func getPosts(c *gin.Context) {
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("pageSize", "10"))
+	sortBy := c.DefaultQuery("sortBy", "edited_at") // 默认按编辑时间排序
+
 	if page < 1 {
 		page = 1
 	}
@@ -56,6 +58,7 @@ func getPosts(c *gin.Context) {
 		pageSize = 10
 	}
 
+	// 构建过滤条件
 	filter := bson.M{}
 	if category := c.Query("category"); category != "" {
 		filter["category"] = category
@@ -67,25 +70,28 @@ func getPosts(c *gin.Context) {
 		}
 	}
 
-	collection := client.Database("forum").Collection("posts")
-	total, err := collection.CountDocuments(context.TODO(), filter)
-	if err != nil {
-		log.Printf("Error counting posts: %v", err)
-		c.JSON(500, gin.H{"error": "Failed to count posts"})
-		return
+	// 确定排序字段
+	var sortField string
+	switch sortBy {
+	case "created_at":
+		sortField = "created_at"
+	case "edited_at":
+		sortField = "edited_at"
+	default:
+		sortField = "edited_at"
 	}
 
-	// 修改 pipeline，添加作者头像信息
+	collection := client.Database("forum").Collection("posts")
+
+	// 构建聚合管道
 	pipeline := mongo.Pipeline{
 		{{Key: "$match", Value: filter}},
-		// 关联用户集合获取头像
 		{{Key: "$lookup", Value: bson.M{
 			"from":         "users",
 			"localField":   "author_id",
 			"foreignField": "_id",
 			"as":           "author_info",
 		}}},
-		// 关联话题集合
 		{{Key: "$lookup", Value: bson.M{
 			"from":         "topics",
 			"localField":   "topic_id",
@@ -96,7 +102,6 @@ func getPosts(c *gin.Context) {
 			"path":                       "$topic",
 			"preserveNullAndEmptyArrays": true,
 		}}},
-		// 添加作者头像字段
 		{{Key: "$addFields", Value: bson.M{
 			"author_avatar": bson.M{
 				"$ifNull": []interface{}{
@@ -105,18 +110,24 @@ func getPosts(c *gin.Context) {
 				},
 			},
 		}}},
-		// 清理临时字段
 		{{Key: "$project", Value: bson.M{
 			"author_info": 0,
 		}}},
-		{{Key: "$sort", Value: bson.M{"created_at": -1}}},
+		{{Key: "$sort", Value: bson.M{sortField: -1}}},
 		{{Key: "$skip", Value: (page - 1) * pageSize}},
 		{{Key: "$limit", Value: pageSize}},
 	}
 
+	// 获取总数
+	total, err := collection.CountDocuments(context.TODO(), filter)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to count posts"})
+		return
+	}
+
+	// 执行查询
 	cursor, err := collection.Aggregate(context.TODO(), pipeline)
 	if err != nil {
-		log.Printf("Error fetching posts: %v", err)
 		c.JSON(500, gin.H{"error": "Failed to fetch posts"})
 		return
 	}
@@ -124,7 +135,6 @@ func getPosts(c *gin.Context) {
 
 	var posts []Post
 	if err = cursor.All(context.TODO(), &posts); err != nil {
-		log.Printf("Error decoding posts: %v", err)
 		c.JSON(500, gin.H{"error": "Failed to decode posts"})
 		return
 	}
@@ -149,6 +159,7 @@ func getPost(c *gin.Context) {
 
 	collection := client.Database("forum").Collection("posts")
 	commentsCollection := client.Database("forum").Collection("comments")
+	usersCollection := client.Database("forum").Collection("users") // 添加用户集合
 
 	var post Post
 	err = collection.FindOne(context.TODO(), bson.M{"_id": id}).Decode(&post)
@@ -157,6 +168,7 @@ func getPost(c *gin.Context) {
 		return
 	}
 
+	// 获取主评论
 	mainCommentsFilter := bson.M{
 		"post_id":   id,
 		"parent_id": bson.M{"$exists": false},
@@ -174,6 +186,7 @@ func getPost(c *gin.Context) {
 		return
 	}
 
+	// 处理每个主评论的回复
 	for i := range mainComments {
 		repliesFilter := bson.M{"parent_id": mainComments[i].ID}
 		repliesCursor, err := commentsCollection.Find(context.TODO(), repliesFilter)
@@ -185,6 +198,15 @@ func getPost(c *gin.Context) {
 		var replies []Comment
 		if err = repliesCursor.All(context.TODO(), &replies); err != nil {
 			continue
+		}
+
+		// 为每个回复获取作者信息
+		for j := range replies {
+			var author User
+			err = usersCollection.FindOne(context.TODO(), bson.M{"_id": replies[j].AuthorID}).Decode(&author)
+			if err == nil {
+				replies[j].AuthorAvatar = author.Avatar
+			}
 		}
 
 		mainComments[i].Replies = replies
@@ -271,17 +293,21 @@ func updatePost(c *gin.Context) {
 		Content  string  `json:"content"`
 		ImageURL string  `json:"imageURL"`
 		TopicID  *string `json:"topic_id"`
+		Category string  `json:"category"`
 	}
 	if err := c.ShouldBindJSON(&updateData); err != nil {
 		c.JSON(400, gin.H{"error": "Invalid request"})
 		return
 	}
 
+	now := time.Now()
 	update := bson.M{
 		"$set": bson.M{
 			"title":     updateData.Title,
 			"content":   updateData.Content,
 			"image_url": updateData.ImageURL,
+			"category":  updateData.Category,
+			"edited_at": now,
 		},
 	}
 
@@ -300,7 +326,10 @@ func updatePost(c *gin.Context) {
 		return
 	}
 
-	c.JSON(200, gin.H{"message": "Post updated successfully"})
+	c.JSON(200, gin.H{
+		"message":   "Post updated successfully",
+		"edited_at": now,
+	})
 }
 
 func deletePost(c *gin.Context) {
@@ -706,6 +735,16 @@ func handleReply(c *gin.Context) {
 	userID, _ := c.Get("user_id")
 	username, _ := c.Get("username")
 
+	// 获取用户信息以获取头像
+	var user User
+	usersCollection := client.Database("forum").Collection("users")
+	err = usersCollection.FindOne(context.TODO(), bson.M{"_id": userID.(primitive.ObjectID)}).Decode(&user)
+	if err != nil {
+		log.Printf("Error fetching user info: %v", err)
+		c.JSON(500, gin.H{"error": "Failed to fetch user info"})
+		return
+	}
+
 	var input struct {
 		Content string `json:"content"`
 	}
@@ -715,33 +754,21 @@ func handleReply(c *gin.Context) {
 	}
 
 	reply := Comment{
-		ID:        primitive.NewObjectID(),
-		PostID:    parentComment.PostID,
-		Content:   input.Content,
-		AuthorID:  userID.(primitive.ObjectID),
-		Author:    username.(string),
-		CreatedAt: time.Now(),
-		ParentID:  parentID,
-		Likes:     []primitive.ObjectID{},
+		ID:           primitive.NewObjectID(),
+		PostID:       parentComment.PostID,
+		Content:      input.Content,
+		AuthorID:     userID.(primitive.ObjectID),
+		Author:       username.(string),
+		AuthorAvatar: user.Avatar, // 设置作者头像
+		CreatedAt:    time.Now(),
+		ParentID:     parentID,
+		Likes:        []primitive.ObjectID{},
 	}
 
 	_, err = collection.InsertOne(context.TODO(), reply)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "Failed to create reply"})
 		return
-	}
-
-	if parentComment.AuthorID != userID.(primitive.ObjectID) {
-		postsCollection := client.Database("forum").Collection("posts")
-		var post Post
-		err = postsCollection.FindOne(context.TODO(), bson.M{"_id": parentComment.PostID}).Decode(&post)
-		if err == nil {
-			notificationContent := fmt.Sprintf("%s 回复了你在《%s》中的评论", username.(string), post.Title)
-			err = createNotification(parentComment.AuthorID, parentComment.PostID, "reply", notificationContent, parentID)
-			if err != nil {
-				log.Printf("Error creating notification: %v", err)
-			}
-		}
 	}
 
 	_, err = collection.UpdateOne(

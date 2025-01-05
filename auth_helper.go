@@ -407,3 +407,151 @@ func getPostsByTopic(c *gin.Context) {
 
 	c.JSON(200, posts)
 }
+
+// auth_helper.go 中添加以下函数
+
+// 发送重置密码邮件
+func sendResetPasswordEmail(to, token string) error {
+	m := gomail.NewMessage()
+	m.SetHeader("From", fmt.Sprintf("%s <%s>", "Tea Forum", emailConfig.From))
+	m.SetHeader("To", to)
+	m.SetHeader("Subject", "重置密码")
+
+	resetLink := fmt.Sprintf("https://www.suxingchahui.space/reset-password?token=%s", token)
+	htmlBody := fmt.Sprintf(`
+        <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+            <h2 style="color: #333;">重置密码</h2>
+            <p style="color: #666;">请点击下面的链接重置您的密码:</p>
+            <a href="%s" style="display: inline-block; padding: 10px 20px; background-color: #4F46E5; color: white; text-decoration: none; border-radius: 5px;">重置密码</a>
+            <p style="color: #666; margin-top: 20px;">此链接1小时内有效</p>
+            <p style="color: #666;">如果您没有请求重置密码，请忽略此邮件</p>
+        </div>
+    `, resetLink)
+
+	m.SetBody("text/html", htmlBody)
+	d := gomail.NewDialer(emailConfig.SmtpHost, 465, emailConfig.From, emailConfig.AuthCode)
+	d.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+
+	if err := d.DialAndSend(m); err != nil {
+		log.Printf("Error sending reset password email: %v", err)
+		return fmt.Errorf("failed to send email: %v", err)
+	}
+
+	return nil
+}
+
+// 发起重置密码
+func handleForgotPassword(c *gin.Context) {
+	var input struct {
+		Email string `json:"email"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(400, gin.H{"error": "请提供邮箱地址"})
+		return
+	}
+
+	collection := client.Database("forum").Collection("users")
+	var user User
+	err := collection.FindOne(context.TODO(), bson.M{"email": input.Email}).Decode(&user)
+	if err != nil {
+		c.JSON(400, gin.H{"error": "该邮箱未注册"})
+		return
+	}
+
+	resetToken := generateRandomToken()
+	expireTime := time.Now().Add(1 * time.Hour)
+
+	_, err = collection.UpdateOne(
+		context.TODO(),
+		bson.M{"_id": user.ID},
+		bson.M{
+			"$set": bson.M{
+				"reset_token":            resetToken,
+				"reset_token_expired_at": expireTime,
+			},
+		},
+	)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "系统错误，请稍后重试"})
+		return
+	}
+
+	if err := sendResetPasswordEmail(user.Email, resetToken); err != nil {
+		c.JSON(500, gin.H{"error": "发送邮件失败，请稍后重试"})
+		return
+	}
+
+	c.JSON(200, gin.H{"message": "重置密码链接已发送到您的邮箱"})
+}
+
+// 验证重置密码token
+func handleCheckResetToken(c *gin.Context) {
+	token := c.Query("token")
+	if token == "" {
+		c.JSON(400, gin.H{"error": "无效的重置链接"})
+		return
+	}
+
+	collection := client.Database("forum").Collection("users")
+	var user User
+	err := collection.FindOne(context.TODO(), bson.M{
+		"reset_token":            token,
+		"reset_token_expired_at": bson.M{"$gt": time.Now()},
+	}).Decode(&user)
+
+	if err != nil {
+		c.JSON(400, gin.H{"error": "重置链接已过期或无效"})
+		return
+	}
+
+	c.JSON(200, gin.H{"valid": true})
+}
+
+// 重置密码
+func handleResetPassword(c *gin.Context) {
+	var input struct {
+		Token       string `json:"token"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(400, gin.H{"error": "请提供新密码"})
+		return
+	}
+
+	collection := client.Database("forum").Collection("users")
+	var user User
+	err := collection.FindOne(context.TODO(), bson.M{
+		"reset_token":            input.Token,
+		"reset_token_expired_at": bson.M{"$gt": time.Now()},
+	}).Decode(&user)
+
+	if err != nil {
+		c.JSON(400, gin.H{"error": "重置链接已过期或无效"})
+		return
+	}
+
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(input.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "处理新密码时出错"})
+		return
+	}
+
+	_, err = collection.UpdateOne(
+		context.TODO(),
+		bson.M{"_id": user.ID},
+		bson.M{
+			"$set": bson.M{
+				"password":               string(hashedPassword),
+				"reset_token":            "",
+				"reset_token_expired_at": time.Time{},
+			},
+		},
+	)
+
+	if err != nil {
+		c.JSON(500, gin.H{"error": "更新密码失败"})
+		return
+	}
+
+	c.JSON(200, gin.H{"message": "密码已成功重置"})
+}

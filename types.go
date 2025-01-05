@@ -32,18 +32,21 @@ type PostInfo struct {
 	Title string `json:"title" bson:"title"`
 }
 
+// types.go 中的 User 结构体更新
 type User struct {
-	ID             primitive.ObjectID `bson:"_id,omitempty" json:"id"`
-	Username       string             `bson:"username" json:"username"`
-	Password       string             `bson:"password,omitempty" json:"-"`
-	Email          string             `bson:"email,omitempty" json:"email"`
-	Bio            string             `bson:"bio,omitempty" json:"bio"`
-	Avatar         string             `bson:"avatar,omitempty" json:"avatar"`
-	QQOpenID       string             `bson:"qq_open_id,omitempty" json:"qq_open_id,omitempty"`
-	IsVerified     bool               `bson:"is_verified" json:"is_verified"`
-	VerifyToken    string             `bson:"verify_token,omitempty" json:"-"`
-	TokenExpiredAt time.Time          `bson:"token_expired_at,omitempty" json:"-"`
-	CreatedAt      time.Time          `bson:"created_at" json:"created_at"`
+	ID                  primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	Username            string             `bson:"username" json:"username"`
+	Password            string             `bson:"password,omitempty" json:"-"`
+	Email               string             `bson:"email,omitempty" json:"email"`
+	Bio                 string             `bson:"bio,omitempty" json:"bio"`
+	Avatar              string             `bson:"avatar,omitempty" json:"avatar"`
+	QQOpenID            string             `bson:"qq_open_id,omitempty" json:"qq_open_id,omitempty"`
+	IsVerified          bool               `bson:"is_verified" json:"is_verified"`
+	VerifyToken         string             `bson:"verify_token,omitempty" json:"-"`
+	TokenExpiredAt      time.Time          `bson:"token_expired_at,omitempty" json:"-"`
+	ResetToken          string             `bson:"reset_token,omitempty" json:"-"`            // 新增
+	ResetTokenExpiredAt time.Time          `bson:"reset_token_expired_at,omitempty" json:"-"` // 新增
+	CreatedAt           time.Time          `bson:"created_at" json:"created_at"`
 }
 
 type UserProfile struct {
@@ -85,8 +88,9 @@ type Post struct {
 	Topic         *Topic             `bson:"topic,omitempty" json:"topic,omitempty"`
 	AuthorID      primitive.ObjectID `bson:"author_id" json:"author_id"`
 	Author        string             `bson:"author" json:"author"`
-	AuthorAvatar  string             `bson:"author_avatar" json:"author_avatar"` // 添加作者头像字段
+	AuthorAvatar  string             `bson:"author_avatar" json:"author_avatar"`
 	CreatedAt     time.Time          `bson:"created_at" json:"created_at"`
+	EditedAt      *time.Time         `bson:"edited_at,omitempty" json:"edited_at,omitempty"`
 	CommentsCount int                `bson:"comments_count" json:"comments_count"`
 	ImageURL      string             `bson:"image_url" json:"imageURL"`
 }

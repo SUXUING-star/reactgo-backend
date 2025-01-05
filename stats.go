@@ -41,7 +41,6 @@ func getCommunityStats(c *gin.Context) {
 	c.JSON(200, stats)
 }
 
-// 获取用户排名
 func getUserRanking(c *gin.Context) {
 	collection := client.Database("forum").Collection("posts")
 
@@ -53,6 +52,23 @@ func getUserRanking(c *gin.Context) {
 		}}},
 		{{Key: "$sort", Value: bson.M{"post_count": -1}}},
 		{{Key: "$limit", Value: 10}},
+		{{Key: "$lookup", Value: bson.M{
+			"from":         "users",
+			"localField":   "_id",
+			"foreignField": "_id",
+			"as":           "user_info",
+		}}},
+		{{Key: "$unwind", Value: bson.M{
+			"path":                       "$user_info",
+			"preserveNullAndEmptyArrays": true,
+		}}},
+		{{Key: "$project", Value: bson.M{
+			"_id":        1,
+			"username":   1,
+			"post_count": 1,
+			"avatar":     "$user_info.avatar",
+			"bio":        "$user_info.bio",
+		}}},
 	}
 
 	cursor, err := collection.Aggregate(context.TODO(), pipeline)
@@ -65,6 +81,8 @@ func getUserRanking(c *gin.Context) {
 		ID        string `bson:"_id" json:"_id"`
 		Username  string `bson:"username" json:"username"`
 		PostCount int    `bson:"post_count" json:"post_count"`
+		Avatar    string `bson:"avatar" json:"avatar"`
+		Bio       string `bson:"bio" json:"bio"`
 	}
 
 	if err = cursor.All(context.TODO(), &rankings); err != nil {
@@ -178,10 +196,10 @@ func getUnreadCount(c *gin.Context) {
 func getCategories(c *gin.Context) {
 	// 这里可以从数据库中获取分类，或者直接返回预定义的分类列表
 	categories := []string{
-		"讨论",
-		"问答",
+		"技术",
+		"生活",
+		"闲聊",
 		"分享",
-		"建议",
 		"其他",
 	}
 	c.JSON(200, categories)
