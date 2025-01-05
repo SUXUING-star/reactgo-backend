@@ -1,5 +1,5 @@
 // go run .
-// git add . && git commit -m "add go backend" && git push origin master
+// git add . && git commit -m "add new" && git push origin master
 package main
 
 import (
@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -81,6 +82,63 @@ func initCloudStorage() error {
 
 	log.Println("Cloud storage initialized successfully")
 	return nil
+}
+
+// 清理无效评论的辅助函数
+func cleanupOrphanedComments() {
+	log.Println("Starting orphaned comments cleanup...")
+
+	commentsCollection := client.Database("forum").Collection("comments")
+
+	// 查找所有已删除帖子的评论
+	pipeline := mongo.Pipeline{
+		bson.D{
+			{Key: "$lookup", Value: bson.M{
+				"from":         "posts",
+				"localField":   "post_id",
+				"foreignField": "_id",
+				"as":           "post",
+			}},
+		},
+		bson.D{
+			{Key: "$match", Value: bson.M{
+				"post": bson.M{"$size": 0},
+			}},
+		},
+	}
+
+	cursor, err := commentsCollection.Aggregate(context.TODO(), pipeline)
+	if err != nil {
+		log.Printf("Error in aggregation: %v", err)
+		return
+	}
+	defer cursor.Close(context.TODO())
+
+	var orphanedComments []Comment
+	if err = cursor.All(context.TODO(), &orphanedComments); err != nil {
+		log.Printf("Error decoding comments: %v", err)
+		return
+	}
+
+	if len(orphanedComments) > 0 {
+		var commentIds []primitive.ObjectID
+		for _, comment := range orphanedComments {
+			commentIds = append(commentIds, comment.ID)
+		}
+
+		// 批量删除所有孤立的评论
+		result, err := commentsCollection.DeleteMany(context.TODO(), bson.M{
+			"_id": bson.M{"$in": commentIds},
+		})
+		if err != nil {
+			log.Printf("Error deleting orphaned comments: %v", err)
+			return
+		}
+
+		log.Printf("Successfully deleted %d orphaned comments", result.DeletedCount)
+	} else {
+		log.Println("No orphaned comments found")
+	}
 }
 
 // 迁移现有文件到云存储
@@ -237,6 +295,7 @@ func setupRouter() *gin.Engine {
 		api.PUT("/notifications/read", authMiddleware(), markNotificationsAsRead)
 
 		// 用户设置相关
+		api.GET("/users/:id", getUserProfile)
 		api.PUT("/users/profile", authMiddleware(), updateUserProfile)
 		api.PUT("/users/password", authMiddleware(), updatePassword)
 
@@ -284,7 +343,7 @@ func main() {
 		log.Fatalf("Failed to initialize cloud storage: %v", err)
 	}
 
-	// 执行迁移
+	// 执行图片文件迁移
 	migrateExistingFilesToCloud()
 
 	// 设置路由
@@ -294,11 +353,12 @@ func main() {
 	if err := r.SetTrustedProxies([]string{"127.0.0.1"}); err != nil {
 		log.Printf("Failed to set trusted proxies: %v", err)
 	}
-
+	cleanupOrphanedComments()
 	// 启动定时清理未验证账户的goroutine
 	go func() {
 		for {
 			cleanupUnverifiedAccounts()
+			cleanupOrphanedComments()
 			time.Sleep(24 * time.Hour)
 		}
 	}()

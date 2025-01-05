@@ -75,8 +75,17 @@ func getPosts(c *gin.Context) {
 		return
 	}
 
+	// 修改 pipeline，添加作者头像信息
 	pipeline := mongo.Pipeline{
 		{{Key: "$match", Value: filter}},
+		// 关联用户集合获取头像
+		{{Key: "$lookup", Value: bson.M{
+			"from":         "users",
+			"localField":   "author_id",
+			"foreignField": "_id",
+			"as":           "author_info",
+		}}},
+		// 关联话题集合
 		{{Key: "$lookup", Value: bson.M{
 			"from":         "topics",
 			"localField":   "topic_id",
@@ -86,6 +95,19 @@ func getPosts(c *gin.Context) {
 		{{Key: "$unwind", Value: bson.M{
 			"path":                       "$topic",
 			"preserveNullAndEmptyArrays": true,
+		}}},
+		// 添加作者头像字段
+		{{Key: "$addFields", Value: bson.M{
+			"author_avatar": bson.M{
+				"$ifNull": []interface{}{
+					bson.M{"$arrayElemAt": []interface{}{"$author_info.avatar", 0}},
+					"",
+				},
+			},
+		}}},
+		// 清理临时字段
+		{{Key: "$project", Value: bson.M{
+			"author_info": 0,
 		}}},
 		{{Key: "$sort", Value: bson.M{"created_at": -1}}},
 		{{Key: "$skip", Value: (page - 1) * pageSize}},
@@ -174,9 +196,20 @@ func getPost(c *gin.Context) {
 	})
 }
 
+// 创建帖子
 func createPost(c *gin.Context) {
 	userID, _ := c.Get("user_id")
 	username, _ := c.Get("username")
+
+	// 获取用户信息以获取头像
+	var user User
+	usersCollection := client.Database("forum").Collection("users")
+	err := usersCollection.FindOne(context.TODO(), bson.M{"_id": userID.(primitive.ObjectID)}).Decode(&user)
+	if err != nil {
+		log.Printf("Error fetching user info: %v", err)
+		c.JSON(500, gin.H{"error": "Failed to fetch user info"})
+		return
+	}
 
 	var post Post
 	if err := c.ShouldBindJSON(&post); err != nil {
@@ -187,6 +220,7 @@ func createPost(c *gin.Context) {
 	post.ID = primitive.NewObjectID()
 	post.AuthorID = userID.(primitive.ObjectID)
 	post.Author = username.(string)
+	post.AuthorAvatar = user.Avatar // 设置作者头像
 	post.CreatedAt = time.Now()
 
 	if !post.TopicID.IsZero() {
@@ -203,7 +237,7 @@ func createPost(c *gin.Context) {
 	}
 
 	collection := client.Database("forum").Collection("posts")
-	_, err := collection.InsertOne(context.TODO(), post)
+	_, err = collection.InsertOne(context.TODO(), post)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "Failed to create post"})
 		return
@@ -294,35 +328,62 @@ func deletePost(c *gin.Context) {
 	collection := client.Database("forum").Collection("posts")
 	commentsCollection := client.Database("forum").Collection("comments")
 
-	if username.(string) != "admin" {
-		var post Post
-		err = collection.FindOne(context.TODO(), bson.M{"_id": postID}).Decode(&post)
+	// 开启事务
+	session, err := client.StartSession()
+	if err != nil {
+		log.Printf("Error starting session: %v", err)
+		c.JSON(500, gin.H{"error": "Internal server error"})
+		return
+	}
+	defer session.EndSession(context.TODO())
+
+	// 在事务中执行删除操作
+	callback := func(sessCtx mongo.SessionContext) (interface{}, error) {
+		// 检查权限
+		if username.(string) != "admin" {
+			var post Post
+			err = collection.FindOne(sessCtx, bson.M{"_id": postID}).Decode(&post)
+			if err != nil {
+				return nil, err
+			}
+
+			if post.AuthorID != userID.(primitive.ObjectID) {
+				return nil, fmt.Errorf("not authorized to delete this post")
+			}
+		}
+
+		// 删除帖子
+		_, err = collection.DeleteOne(sessCtx, bson.M{"_id": postID})
 		if err != nil {
-			c.JSON(404, gin.H{"error": "Post not found"})
-			return
+			return nil, err
 		}
 
-		if post.AuthorID != userID.(primitive.ObjectID) {
+		// 删除相关评论
+		deleteResult, err := commentsCollection.DeleteMany(sessCtx, bson.M{"post_id": postID})
+		if err != nil {
+			return nil, err
+		}
+
+		return deleteResult.DeletedCount, nil
+	}
+
+	// 执行事务
+	result, err := session.WithTransaction(context.TODO(), callback)
+	if err != nil {
+		if err.Error() == "not authorized to delete this post" {
 			c.JSON(403, gin.H{"error": "Not authorized to delete this post"})
-			return
+		} else {
+			log.Printf("Error in transaction: %v", err)
+			c.JSON(500, gin.H{"error": "Failed to delete post and comments"})
 		}
-	}
-
-	_, err = collection.DeleteOne(context.TODO(), bson.M{"_id": postID})
-	if err != nil {
-		log.Printf("Error deleting post: %v", err)
-		c.JSON(500, gin.H{"error": "Failed to delete post"})
 		return
 	}
 
-	_, err = commentsCollection.DeleteMany(context.TODO(), bson.M{"post_id": postID})
-	if err != nil {
-		log.Printf("Error deleting comments: %v", err)
-		c.JSON(200, gin.H{"message": "Post deleted but failed to delete some comments"})
-		return
-	}
-
-	c.JSON(200, gin.H{"message": "Post and all related comments deleted successfully"})
+	deletedCommentsCount := result.(int64)
+	c.JSON(200, gin.H{
+		"message":                "Post and all related comments deleted successfully",
+		"deleted_comments_count": deletedCommentsCount,
+	})
 }
 
 // 话题相关处理函数
@@ -506,6 +567,7 @@ func getComments(c *gin.Context) {
 	c.JSON(200, comments)
 }
 
+// 创建评论
 func createComment(c *gin.Context) {
 	postID, err := primitive.ObjectIDFromHex(c.Param("id"))
 	if err != nil {
@@ -516,17 +578,19 @@ func createComment(c *gin.Context) {
 	userID, _ := c.Get("user_id")
 	username, _ := c.Get("username")
 
-	var comment Comment
-	if err := c.ShouldBindJSON(&comment); err != nil {
-		c.JSON(400, gin.H{"error": "Invalid request"})
+	// 获取用户信息以获取头像
+	var user User
+	usersCollection := client.Database("forum").Collection("users")
+	err = usersCollection.FindOne(context.TODO(), bson.M{"_id": userID.(primitive.ObjectID)}).Decode(&user)
+	if err != nil {
+		log.Printf("Error fetching user info: %v", err)
+		c.JSON(500, gin.H{"error": "Failed to fetch user info"})
 		return
 	}
 
-	postsCollection := client.Database("forum").Collection("posts")
-	var post Post
-	err = postsCollection.FindOne(context.TODO(), bson.M{"_id": postID}).Decode(&post)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "Failed to fetch post"})
+	var comment Comment
+	if err := c.ShouldBindJSON(&comment); err != nil {
+		c.JSON(400, gin.H{"error": "Invalid request"})
 		return
 	}
 
@@ -534,9 +598,11 @@ func createComment(c *gin.Context) {
 	comment.PostID = postID
 	comment.AuthorID = userID.(primitive.ObjectID)
 	comment.Author = username.(string)
+	comment.AuthorAvatar = user.Avatar // 设置作者头像
 	comment.CreatedAt = time.Now()
 	comment.Likes = []primitive.ObjectID{}
 	comment.Replies = []Comment{}
+	log.Printf("Comment: %+v", comment)
 
 	collection := client.Database("forum").Collection("comments")
 	_, err = collection.InsertOne(context.TODO(), comment)
@@ -545,14 +611,24 @@ func createComment(c *gin.Context) {
 		return
 	}
 
-	if post.AuthorID != userID.(primitive.ObjectID) {
-		notificationContent := fmt.Sprintf("%s 评论了你的帖子《%s》", username.(string), post.Title)
-		err = createNotification(post.AuthorID, postID, "comment", notificationContent)
-		if err != nil {
-			log.Printf("Error creating notification: %v", err)
+	// 获取帖子信息并创建通知
+	postsCollection := client.Database("forum").Collection("posts")
+	var post Post
+	err = postsCollection.FindOne(context.TODO(), bson.M{"_id": postID}).Decode(&post)
+	if err != nil {
+		log.Printf("Error fetching post: %v", err)
+	} else {
+		// 只有在评论者不是帖子作者时才创建通知
+		if post.AuthorID != userID.(primitive.ObjectID) {
+			notificationContent := fmt.Sprintf("%s 评论了你的帖子《%s》", username.(string), post.Title)
+			err = createNotification(post.AuthorID, postID, "comment", notificationContent)
+			if err != nil {
+				log.Printf("Error creating notification: %v", err)
+			}
 		}
 	}
 
+	// 更新帖子评论数
 	_, err = postsCollection.UpdateOne(
 		context.TODO(),
 		bson.M{"_id": postID},
@@ -755,37 +831,137 @@ func getUserComments(c *gin.Context) {
 	c.JSON(200, comments)
 }
 
-func updateUserProfile(c *gin.Context) {
-	userID, _ := c.Get("user_id")
+// 在 handler.go 中更新或添加以下处理函数
 
-	var updateData struct {
-		Nickname string `json:"nickname"`
-		Email    string `json:"email"`
-		Bio      string `json:"bio"`
-	}
-
-	if err := c.ShouldBindJSON(&updateData); err != nil {
-		c.JSON(400, gin.H{"error": "Invalid request"})
+// 获取用户信息
+func getUserProfile(c *gin.Context) {
+	userID, err := primitive.ObjectIDFromHex(c.Param("id"))
+	if err != nil {
+		c.JSON(400, gin.H{"error": "Invalid user ID"})
 		return
 	}
 
 	collection := client.Database("forum").Collection("users")
-	_, err := collection.UpdateOne(
+
+	var user UserProfile
+	err = collection.FindOne(context.TODO(), bson.M{"_id": userID}).Decode(&user)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			c.JSON(404, gin.H{"error": "User not found"})
+		} else {
+			log.Printf("Error fetching user: %v", err)
+			c.JSON(500, gin.H{"error": "Failed to fetch user"})
+		}
+		return
+	}
+
+	// 构建用户资料响应
+	response := gin.H{
+		"id":        user.ID,
+		"username":  user.Username,
+		"bio":       user.Bio,
+		"avatar":    user.Avatar,
+		"createdAt": user.CreatedAt,
+	}
+
+	// 只有用户查看自己的资料时才返回邮箱
+	if authUserID, exists := c.Get("user_id"); exists && authUserID.(primitive.ObjectID) == userID {
+		response["email"] = user.Email
+	}
+
+	c.JSON(200, response)
+}
+
+// 更新用户资料
+func updateUserProfile(c *gin.Context) {
+	userID, _ := c.Get("user_id")
+
+	var input UserUpdateInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(400, gin.H{"error": "Invalid request data"})
+		return
+	}
+
+	// 验证昵称不为空
+	if input.Nickname == "" {
+		c.JSON(400, gin.H{"error": "Nickname cannot be empty"})
+		return
+	}
+
+	// 构建更新文档
+	update := bson.M{
+		"$set": bson.M{
+			"username": input.Nickname,
+			"bio":      input.Bio,
+			"avatar":   input.Avatar,
+		},
+	}
+
+	// 如果提供了邮箱，也更新邮箱
+	if input.Email != "" {
+		update["$set"].(bson.M)["email"] = input.Email
+	}
+
+	collection := client.Database("forum").Collection("users")
+	result, err := collection.UpdateOne(
 		context.TODO(),
 		bson.M{"_id": userID.(primitive.ObjectID)},
-		bson.M{"$set": bson.M{
-			"username": updateData.Nickname,
-			"email":    updateData.Email,
-			"bio":      updateData.Bio,
-		}},
+		update,
 	)
 
 	if err != nil {
+		log.Printf("Error updating user profile: %v", err)
 		c.JSON(500, gin.H{"error": "Failed to update profile"})
 		return
 	}
 
-	c.JSON(200, gin.H{"message": "Profile updated successfully"})
+	if result.ModifiedCount == 0 {
+		c.JSON(404, gin.H{"error": "User not found"})
+		return
+	}
+
+	// 异步更新用户的帖子和评论中的作者名称
+	// 在 updateUserProfile 函数的异步更新部分添加头像更新
+	go func() {
+		postsCollection := client.Database("forum").Collection("posts")
+		commentsCollection := client.Database("forum").Collection("comments")
+
+		// 更新帖子中的作者头像
+		_, err := postsCollection.UpdateMany(
+			context.TODO(),
+			bson.M{"author_id": userID.(primitive.ObjectID)},
+			bson.M{"$set": bson.M{
+				"author":        input.Nickname,
+				"author_avatar": input.Avatar,
+			}},
+		)
+		if err != nil {
+			log.Printf("Error updating posts author info: %v", err)
+		}
+
+		// 更新评论中的作者头像
+		_, err = commentsCollection.UpdateMany(
+			context.TODO(),
+			bson.M{"author_id": userID.(primitive.ObjectID)},
+			bson.M{"$set": bson.M{
+				"author":        input.Nickname,
+				"author_avatar": input.Avatar,
+			}},
+		)
+		if err != nil {
+			log.Printf("Error updating comments author info: %v", err)
+		}
+	}()
+
+	c.JSON(200, gin.H{
+		"message": "Profile updated successfully",
+		"user": gin.H{
+			"username": input.Nickname,
+			"email":    input.Email,
+			"bio":      input.Bio,
+			"avatar":   input.Avatar,
+		},
+	})
 }
 
 // 搜索相关处理函数

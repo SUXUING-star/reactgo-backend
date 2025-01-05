@@ -32,18 +32,35 @@ type PostInfo struct {
 	Title string `json:"title" bson:"title"`
 }
 
-// 更新User结构体以支持QQ登录
 type User struct {
 	ID             primitive.ObjectID `bson:"_id,omitempty" json:"id"`
 	Username       string             `bson:"username" json:"username"`
 	Password       string             `bson:"password,omitempty" json:"-"`
 	Email          string             `bson:"email,omitempty" json:"email"`
-	QQOpenID       string             `bson:"qq_open_id,omitempty" json:"qq_open_id,omitempty"`
+	Bio            string             `bson:"bio,omitempty" json:"bio"`
 	Avatar         string             `bson:"avatar,omitempty" json:"avatar"`
+	QQOpenID       string             `bson:"qq_open_id,omitempty" json:"qq_open_id,omitempty"`
 	IsVerified     bool               `bson:"is_verified" json:"is_verified"`
 	VerifyToken    string             `bson:"verify_token,omitempty" json:"-"`
 	TokenExpiredAt time.Time          `bson:"token_expired_at,omitempty" json:"-"`
 	CreatedAt      time.Time          `bson:"created_at" json:"created_at"`
+}
+
+type UserProfile struct {
+	ID        primitive.ObjectID `bson:"_id" json:"id"`
+	Username  string             `bson:"username" json:"username"`
+	Email     string             `bson:"email,omitempty" json:"email,omitempty"`
+	Bio       string             `bson:"bio,omitempty" json:"bio"`
+	Avatar    string             `bson:"avatar,omitempty" json:"avatar"`
+	CreatedAt time.Time          `bson:"created_at" json:"created_at"`
+}
+
+// UserUpdateInput 用于接收用户资料更新请求
+type UserUpdateInput struct {
+	Nickname string `json:"nickname" binding:"required"`
+	Email    string `json:"email"`
+	Bio      string `json:"bio"`
+	Avatar   string `json:"avatar"`
 }
 
 type Claims struct {
@@ -68,21 +85,23 @@ type Post struct {
 	Topic         *Topic             `bson:"topic,omitempty" json:"topic,omitempty"`
 	AuthorID      primitive.ObjectID `bson:"author_id" json:"author_id"`
 	Author        string             `bson:"author" json:"author"`
+	AuthorAvatar  string             `bson:"author_avatar" json:"author_avatar"` // 添加作者头像字段
 	CreatedAt     time.Time          `bson:"created_at" json:"created_at"`
 	CommentsCount int                `bson:"comments_count" json:"comments_count"`
 	ImageURL      string             `bson:"image_url" json:"imageURL"`
 }
 
 type Comment struct {
-	ID        primitive.ObjectID   `bson:"_id,omitempty" json:"_id"`
-	PostID    primitive.ObjectID   `bson:"post_id" json:"post_id"`
-	Content   string               `bson:"content" json:"content"`
-	AuthorID  primitive.ObjectID   `bson:"author_id" json:"author_id"`
-	Author    string               `bson:"author" json:"author"`
-	CreatedAt time.Time            `bson:"created_at" json:"created_at"`
-	ParentID  primitive.ObjectID   `bson:"parent_id,omitempty" json:"parent_id,omitempty"`
-	Likes     []primitive.ObjectID `bson:"likes,omitempty" json:"likes,omitempty"`
-	Replies   []Comment            `bson:"replies,omitempty" json:"replies"`
+	ID           primitive.ObjectID   `bson:"_id,omitempty" json:"_id"`
+	PostID       primitive.ObjectID   `bson:"post_id" json:"post_id"`
+	Content      string               `bson:"content" json:"content"`
+	AuthorID     primitive.ObjectID   `bson:"author_id" json:"author_id"`
+	Author       string               `bson:"author" json:"author"`
+	AuthorAvatar string               `bson:"author_avatar" json:"author_avatar"` // 添加作者头像字段
+	CreatedAt    time.Time            `bson:"created_at" json:"created_at"`
+	ParentID     primitive.ObjectID   `bson:"parent_id,omitempty" json:"parent_id,omitempty"`
+	Likes        []primitive.ObjectID `bson:"likes,omitempty" json:"likes,omitempty"`
+	Replies      []Comment            `bson:"replies,omitempty" json:"replies"`
 }
 
 type Topic struct {
