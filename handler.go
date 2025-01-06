@@ -49,7 +49,7 @@ func getLatestComments(c *gin.Context) {
 func getPosts(c *gin.Context) {
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("pageSize", "10"))
-	sortBy := c.DefaultQuery("sortBy", "edited_at") // 默认按编辑时间排序
+	sortBy := c.DefaultQuery("sortBy", "created_at") // 默认按编辑时间排序
 
 	if page < 1 {
 		page = 1
