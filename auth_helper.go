@@ -41,7 +41,7 @@ func isValidEmail(email string) bool {
 // 发送验证邮件
 func sendVerificationEmail(to, token string) error {
 	m := gomail.NewMessage()
-	m.SetHeader("From", fmt.Sprintf("%s <%s>", "星云茶会", emailConfig.From))
+	m.SetHeader("From", fmt.Sprintf("%s <%s>", "xingyunchahui", emailConfig.From))
 	m.SetHeader("To", to)
 	m.SetHeader("Subject", "验证您的邮箱")
 
@@ -413,7 +413,7 @@ func getPostsByTopic(c *gin.Context) {
 // 发送重置密码邮件
 func sendResetPasswordEmail(to, token string) error {
 	m := gomail.NewMessage()
-	m.SetHeader("From", fmt.Sprintf("%s <%s>", "星云茶会", emailConfig.From))
+	m.SetHeader("From", fmt.Sprintf("%s <%s>", "xingyunchahui", emailConfig.From))
 	m.SetHeader("To", to)
 	m.SetHeader("Subject", "重置密码")
 
